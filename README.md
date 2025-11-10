@@ -1,385 +1,139 @@
 # Driver Backup Tool
 
-A Rust-based utility for backing up non-Microsoft device drivers from Windows systems using Windows Management Instrumentation (WMI) and `pnputil`.
-
-## Overview
-
-This tool scans your Windows system for all installed device drivers, filters out Microsoft drivers, and exports remaining third-party drivers to organized backup folders with device-specific naming. It creates a comprehensive summary of all exported drivers for easy reference and management.
+A Rust-based tool to backup and manage non-Microsoft drivers on Windows systems.
 
 ## Features
 
-- 🔍 **Automatic Driver Discovery**: Queries WMI to find all installed PnP drivers
-- 🚫 **Microsoft Driver Filtering**: Excludes Microsoft and Microsoft Corporation drivers
-- 🏷️ **Device Name Integration**: Folder names include actual device names for easy identification
-- 📁 **Hierarchical Organization**: Groups drivers by device class GUID → version with device names
-- 📊 **Detailed Summary**: Generates comprehensive driver inventory reports
-- 🔧 **Dry Run Mode**: Preview what would be backed up without actually exporting
-- 📝 **Verbose Logging**: Detailed output showing device information during backup
-- ⏰ **Timestamped Backups**: Each backup session gets a unique timestamp
-- 🔄 **Smart Deduplication**: Same driver versions for multiple devices grouped together
+- 🔍 **Automatic Driver Detection**: Queries WMI for all installed PnP signed drivers
+- 🚫 **Smart Filtering**: Excludes Microsoft drivers, backing up only third-party drivers
+- 📁 **Organized by Device Class**: Groups drivers by type (Display, Net, Media, etc.)
+- 📦 **INF-Based Packaging**: Groups devices sharing the same driver package
+- 📊 **Database-Ready**: Generates CSV files for easy database import
+- 📝 **Comprehensive Logging**: Detailed summary files and per-driver information
+- 🔧 **Dry Run Mode**: Preview without actually exporting
+- ⏰ **Timestamped Backups**: Unique timestamp for each backup session
 
-## Installation
+## Driver Information Captured
 
-### Prerequisites
+- Device Name, Driver Version, Driver Date
+- Hardware ID, Device ID, INF Name
+- Description, Provider, Device Class, Class GUID
 
-- Windows operating system (Windows 10/11 recommended)
-- Rust toolchain (latest stable version)
-- Administrative privileges (required for `pnputil` access)
-- Windows Management Instrumentation (WMI) service running
+## Folder Structure
 
-### Build from Source
+The backup creates the following structure:
 
-```bash
-git clone <repository-url>
-cd driver-backup
-cargo build --release
+```
+driver_backup/
+└── drivers_YYYYMMDD_HHMMSS/
+    ├── Display/
+    │   ├── NVIDIA GeForce RTX 3080_30.0.15.1179 Package/
+    │   │   ├── driver_info.csv
+    │   │   └── [exported driver files]
+    │   └── AMD Radeon RX 6800_21.10.2 Package/
+    │       ├── driver_info.csv
+    │       └── [exported driver files]
+    ├── Net/
+    │   ├── Intel Ethernet I219-V_12.19.2.45 Package/
+    │   │   ├── driver_info.csv
+    │   │   └── [exported driver files]
+    │   └── Realtek PCIe GbE_10.050.1021.2021 Package/
+    │       ├── driver_info.csv
+    │       └── [exported driver files]
+    ├── Media/
+    │   └── Realtek High Definition Audio_6.0.9346.1 Package/
+    │       ├── driver_info.csv
+    │       └── [exported driver files]
+    ├── all_drivers.csv              # Master CSV with all drivers
+    └── driver_backup_summary.txt    # Human-readable summary
 ```
 
-The compiled binary will be available at `target/release/driver-backup.exe`.
+### Key Features:
+
+- **Device Class Organization**: Display, Net, Media folders mirror Windows Device Manager
+- **Version in Folder Names**: `DeviceName_Version Package` format for easy identification
+- **INF Grouping**: Devices sharing the same driver package combined in one folder
+- **CSV per Package**: Each folder has `driver_info.csv` for database upload
+- **Master CSV**: `all_drivers.csv` with all drivers and folder paths
+- **Organized Summary**: Text summary grouped by device class
+
+### Why This Structure?
+
+**Device Classes**: Similar devices grouped together (Display, Net, Media) for easier navigation and restoration by priority (display first, then network, etc.)
+
+**INF Grouping**: One driver package (INF) often supports multiple devices. Example: One NVIDIA INF covers RTX 3060, 3070, 3080. All are grouped in one folder for efficient backup and restore.
 
 ## Usage
 
-### Command Syntax
+**⚠️ Administrator rights required** - Run as Administrator or you'll get an error.
 
-```bash
-driver-backup.exe backup [OPTIONS]
+```powershell
+# Basic backup
+.\driver-backup.exe
+
+# Custom output directory with verbose logging
+.\driver-backup.exe backup --output "D:\MyBackups" --verbose
+
+# Preview without backing up
+.\driver-backup.exe backup --dry-run --verbose
 ```
 
 ### Command Line Options
 
-| Option | Short | Long | Description |
-|--------|-------|------|-------------|
-| Output directory | `-o` | `--output` | Directory where driver backups will be stored (default: `driver_backup`) |
-| Verbose mode | `-v` | `--verbose` | Enable detailed logging output with device information |
-| Dry run | `-d` | `--dry-run` | Show what would be backed up without actually exporting |
-| Help | `-h` | `--help` | Display help information |
+```
+-o, --output <PATH>    Output directory (default: "driver_backup")
+-v, --verbose          Enable verbose output
+-d, --dry-run          Preview operations without executing
+-h, --help             Print help
+```
 
-### Usage Examples
+## CSV File Format
 
-```bash
-# Basic backup to default directory
-driver-backup.exe backup
+**Columns**: Device Name, Driver Version, Driver Date, Hardware ID, Device ID, INF Name, Description, Provider, Device Class, Class GUID, Folder Name (master CSV only)
 
-# Backup to specific directory with verbose output
-driver-backup.exe backup --output "C:\DriverBackups" --verbose
+Designed for easy import into database systems.
 
-# Dry run to see what would be backed up
-driver-backup.exe backup --dry-run --verbose
+## Requirements & Installation
 
-# Quick backup with minimal output
-driver-backup.exe backup -o "D:\MyDrivers"
+- **Windows 10/11** (Server 2016+ supported)
+- **Administrator Rights** - Required for WMI access and pnputil
+- **Rust** - To build from source
+
+```powershell
+# Build release version
+cargo build --release
+
+# Run directly
+cargo run --release -- backup --verbose
 ```
 
 ## How It Works
 
-1. **Driver Discovery**: Queries Windows WMI `Win32_PnPSignedDriver` class to enumerate all installed drivers
-2. **Microsoft Filtering**: Identifies and excludes Microsoft and Microsoft Corporation drivers
-3. **Device Grouping**: Organizes drivers by device class GUID for logical grouping
-4. **Version Deduplication**: Groups same driver versions for multiple devices together
-5. **Device Name Integration**: Includes actual device names in folder structure
-6. **Export Process**: Uses Windows `pnputil /export-driver` to extract driver files
-7. **Summary Generation**: Creates detailed driver inventory report
-
-## Backup Structure
-
-The tool creates a hierarchical folder structure that clearly identifies which device each driver belongs to:
-
-```
-driver_backup/
-└── drivers_20251030_112428/                    # Main backup folder with timestamp
-    ├── Display_4d36e968_e325_11ce_bfc1_08002be10318/    # Display devices
-    │   └── Intel(R) UHD Graphics 770_Intel Corporation_32.0.101.7040_2025-09-19/
-    │       ├── oem2.inf                                 # Driver installation file
-    │       ├── igd_dch.sys                             # System driver
-    │       └── igd_dch.cat                             # Security catalog
-    ├── Net_4d36e972_e325_11ce_bfc1_08002be10318/      # Network devices
-    │   ├── Realtek PCIe GbE Family Controller_Realtek_10.56.119.2022_2022-01-19/
-    │   ├── VMware Virtual Ethernet Adapter for_VMware_ Inc._14.0.0.8_2023-02-11/
-    │   └── TAP-Windows Adapter V9 for OpenVPN _TAP-Windows Provider_9.24.2.601_2019-09-27/
-    ├── System_4d36e97d_e325_11ce-bfc1-08002be10318/    # System devices
-    │   ├── Intel(R) Serial IO GPIO Host Contro_Intel Corporation_30.100.2417.30_2024-04-24/
-    │   ├── Intel(R) SPI (flash) Controller - 7_INTEL_10.1.46.5_1968-07-18/
-    │   └── AMD Special Tools Driver_Advanced Micro Devic_1.7.16.219_2022-06-22/
-    ├── Media_4d36e96c_e325_11ce_bfc1_08002be10318/     # Media devices
-    │   └── Realtek High Definition Audio_Realtek Semiconducto_6.0.9151.1_2021-04-13/
-    └── driver_backup_summary.txt                      # Comprehensive driver report
-```
-
-### Folder Naming Convention
-
-**Format**: `DeviceName_Provider_Version_Date`
-
-- **DeviceName**: Actual hardware device name (truncated to 35 chars)
-- **Provider**: Driver manufacturer/provider (truncated to 20 chars)
-- **Version**: Driver version number (truncated to 15 chars)
-- **Date**: Driver release date in YYYY-MM-DD format
-
-**Examples**:
-- `Intel(R) UHD Graphics 770_Intel Corporation_32.0.101.7040_2025-09-19`
-- `Realtek PCIe GbE Family Controller_Realtek_10.56.119.2022_2022-01-19`
-- `VMware Virtual Ethernet Adapter for_VMware_ Inc._14.0.0.8_2023-02-11`
-- `HD Audio Driver for Display Audio_Intel Corporation_32.0.101.7040_2025-09-19`
-- `Nefarius HidHide Device_Nefarius Software So_1.4.181.0_2023-10-31`
-
-## Driver Information Captured
-
-For each backed-up driver, tool records:
-
-- **Sequential Number**: Global numbering across all drivers (1, 2, 3...)
-- **Device Class**: Windows device class grouping (DISPLAY, NET, SYSTEM, etc.)
-- **Device Name**: Hardware device name (primary identifier)
-- **Provider/Manufacturer**: Driver publisher or manufacturer
-- **Description**: Device description from Windows
-- **Driver Version**: Specific version number
-- **Release Date**: Driver release date
-- **Class GUID**: Unique device class identifier
-- **Original INF**: OEM INF filename
-- **Folder Location**: Backup folder path
-
-## Supported Device Classes
-
-The tool recognizes and organizes drivers for these device classes (shown in summary order):
-
-1. **DISPLAY**: Graphics cards, display adapters
-2. **MEDIA**: Audio devices, sound cards
-3. **MONITOR**: Display monitors
-4. **NET**: Network adapters, Ethernet, WiFi, VPN
-5. **SOFTWARECOMPONENT**: Software drivers and components
-6. **SYSTEM**: Chipset, motherboard components, system devices
-7. **HIDClass**: Human interface devices (keyboards, mice)
-8. **USB**: USB controllers and devices
-9. **Unknown**: Unrecognized device types
-
-Each class appears in alphabetical order in the summary file with sequential numbering across all classes.
-
-## Summary File Format
-
-The summary file (`driver_backup_summary.txt`) contains a sequential list of all exported drivers organized by device class:
-
-```
-Driver Export Summary
-Generated: 2025-10-30 11:33:38 UTC
-Total drivers exported: 25
-
-Drivers by Class:
-=================
-
-DISPLAY (1 drivers):
-1. oem2.inf
-   Device: Intel(R) UHD Graphics 770
-   Provider: Intel Corporation
-   Description: Intel(R) UHD Graphics 770
-   Version: 32.0.101.7040
-   Date: 2025-09-19
-   Folder: Intel(R) UHD Graphics 770_Intel Corporation_32.0.101.7040_2025-09-19
-   Class GUID: {4d36e968-e325-11ce-bfc1-08002be10318}
-
-NET (4 drivers):
-2. oem67.inf
-   Device: VMware Virtual Ethernet Adapter for VMnet8
-   Provider: VMware, Inc.
-   Description: VMware Virtual Ethernet Adapter for VMnet8
-   Version: 14.0.0.8
-   Date: 2023-02-11
-   Folder: VMware Virtual Ethernet Adapter for_VMware_ Inc._14.0.0.8_2023-02-11
-
-3. oem67.inf
-   Device: VMware Virtual Ethernet Adapter for VMnet1
-   Provider: VMware, Inc.
-   Description: VMware Virtual Ethernet Adapter for VMnet1
-   Version: 14.0.0.8
-   Date: 2023-02-11
-   Folder: VMware Virtual Ethernet Adapter for_VMware_ Inc._14.0.0.8_2023-02-11
-
-[... more drivers with sequential numbering ...]
-
-SYSTEM (18 drivers):
-[... system drivers with sequential numbering ...]
-```
-
-**Key Features:**
-- **Sequential Numbering**: Global numbering from 1 to N across all drivers
-- **Class-based Grouping**: Drivers grouped by device class (DISPLAY, NET, SYSTEM, etc.)
-- **Alphabetical Class Order**: Classes appear in alphabetical order for consistency
-- **Complete Metadata**: Each driver entry includes device name, provider, version, date, and folder location
-- **Easy Reference**: Sequential numbers make it easy to reference specific drivers during troubleshooting or documentation
-
-## Requirements
-
-### System Requirements
-
-- **Operating System**: Windows 10/11 (Server 2016+ also supported)
-- **Privileges**: Administrative rights required
-- **Services**: Windows Management Instrumentation (WMI) service must be running
-- **Disk Space**: Sufficient space for driver files (typically 100MB-1GB depending on system)
-
-### Technical Requirements
-
-- **Windows API**: Access to WMI and driver management APIs
-- **pnputil**: Windows PnP utility (built into modern Windows)
-- **File System**: Write permissions to backup directory
-
-## Dependencies
-
-```toml
-[dependencies]
-wmi = "0.13"
-tokio = { version = "1.47", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }
-chrono = "0.4"
-```
-
-## Error Handling
-
-The tool includes comprehensive error handling for:
-
-### WMI and Driver Access
-- WMI connection failures
-- Missing or corrupted driver information
-- Permission denied errors
-
-### File Operations
-- Invalid backup directory paths
-- Insufficient disk space
-- File system permission issues
-
-### Driver Export
-- `pnputil` execution failures
-- Protected or system drivers
-- Path length limitations
-
-### Common Error Messages and Solutions
-
-| Error | Cause | Solution |
-|-------|-------|----------|
-| "Access Denied" | Insufficient privileges | Run as Administrator |
-| "WMI Connection Failed" | WMI service not running | Start Windows Management Instrumentation service |
-| "No non-Microsoft drivers found" | Only Microsoft drivers installed | Check for third-party hardware/drivers |
-| "pnputil not found" | Older Windows version | Use Windows 10/11 or install Windows SDK |
-| "Path too long" | Deep folder structure | Use shorter backup path or move to root |
-
-## Security Considerations
-
-- **Read-Only Operations**: Tool only reads driver information, doesn't modify system
-- **No Configuration Changes**: Driver installations are not modified
-- **Administrative Access**: Required only for reading driver information
-- **Backup Files**: Only exports existing driver files from system
-- **No Network Access**: Tool works completely offline
-
-## Use Cases
-
-### System Administrators
-- Pre-deployment driver preparation
-- System migration planning
-- Driver inventory management
-- Backup before system updates
-
-### IT Support Professionals
-- Driver troubleshooting preparation
-- Hardware replacement scenarios
-- Multi-system driver deployment
-- Remote driver management
-
-### Power Users
-- System backup strategies
-- Hardware upgrade preparation
-- Dual-boot driver management
-- Custom Windows installations
-
-### OEM/PC Builders
-- Driver bundle creation
-- System image preparation
-- Quality assurance testing
-- Deployment automation
-
-## Performance
-
-### Typical Performance Metrics
-- **Discovery Time**: 2-5 seconds for driver enumeration
-- **Backup Time**: 30 seconds - 2 minutes depending on number of drivers
-- **File Sizes**: 100MB - 1GB typical for modern systems
-- **Memory Usage**: <50MB during operation
-
-### Optimization Features
-- Efficient WMI queries
-- Parallel driver processing
-- Smart folder naming to avoid path limits
-- Memory-conscious file operations
+1. Queries WMI's `Win32_PnPSignedDriver` class
+2. Filters out Microsoft-provided drivers
+3. Organizes by Device Class (Display, Net, Media, etc.)
+4. Groups by INF file (same package → one folder)
+5. Exports using `pnputil /export-driver`
+6. Creates CSV files and summary for each package
 
 ## Troubleshooting
 
-### Advanced Troubleshooting Steps
+| Issue                       | Solution                                                  |
+| --------------------------- | --------------------------------------------------------- |
+| "Admin privileges required" | Right-click → Run as Administrator                        |
+| "Failed to export driver"   | Check verbose output; driver may be protected/corrupted   |
+| "Path too long"             | Use shorter output path (e.g., `C:\Backup`)               |
+| "No drivers found"          | Only third-party drivers are backed up; check WMI service |
 
-1. **Check WMI Service**: Run `services.msc` and ensure "Windows Management Instrumentation" is running
-2. **Verify Permissions**: Confirm administrative privileges with `whoami /priv`
-3. **Test pnputil**: Run `pnputil /enum-drivers` to verify tool availability
-4. **Check Disk Space**: Ensure sufficient space in backup location
-5. **Path Length**: Use shorter backup paths if experiencing path limit errors
+## Common Use Cases
 
-### Debug Mode
-
-For troubleshooting, use verbose mode:
-```bash
-driver-backup.exe backup --verbose --dry-run
-```
-
-This will show all driver discovery and processing without creating files.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-### Development Setup
-
-```bash
-# Clone repository
-git clone <repository-url>
-cd driver-backup
-
-# Install Rust toolchain
-rustup update stable
-rustup default stable
-
-# Build in debug mode for development
-cargo build
-
-# Run tests
-cargo test
-
-# Build release version
-cargo build --release
-```
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Disclaimer
-
-This tool is provided as-is for educational and backup purposes. 
-
-**⚠️ Important Notes:**
-- Always test driver restores in a controlled environment
-- Backup your system before making any driver changes
-- The authors are not responsible for system damage or data loss
-- Use at your own risk and discretion
-
-## Support
-
-For issues, questions, or feature requests:
-- Create an issue on the project repository
-- Include system information (Windows version, hardware details)
-- Provide verbose output when reporting problems
-- Share error messages and steps to reproduce
+- **System Migration**: Backup before OS reinstall
+- **Driver Management**: Maintain database of third-party drivers
+- **IT Support**: Pre-deployment preparation, troubleshooting
+- **Compliance**: Audit trail for driver versions
 
 ---
 
-**Version**: 1.0.0  
-**Last Updated**: 2025-10-30  
+**Version**: 2.2  
+**Last Updated**: 2025-11-10  
 **Compatible**: Windows 10/11, Server 2016+
