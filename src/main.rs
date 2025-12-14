@@ -428,6 +428,155 @@ impl DriverBackup {
         self.backup_drivers(non_ms_drivers).await?;
         Ok(())
     }
+
+    /// Build lookup table for OEM INF to actual INF name mapping
+    fn build_inf_lookup() -> HashMap<String, String> {
+        let mut lookup = HashMap::new();
+        
+        println!("Building INF name lookup table...");
+        
+        let output = Command::new("pnputil")
+            .arg("/enum-drivers")
+            .output();
+        
+        if let Ok(result) = output {
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            let mut current_oem: Option<String> = None;
+            let mut current_original: Option<String> = None;
+            
+            for line in stdout.lines() {
+                let line_lower = line.to_lowercase();
+                
+                if line_lower.contains("published name") {
+                    if let Some(val) = line.split(':').nth(1) {
+                        current_oem = Some(val.trim().to_lowercase());
+                    }
+                }
+                if line_lower.contains("original name") {
+                    if let Some(val) = line.split(':').nth(1) {
+                        current_original = Some(val.trim().to_string());
+                    }
+                }
+                
+                // Save mapping when we have both
+                if let (Some(ref oem), Some(ref original)) = (&current_oem, &current_original) {
+                    lookup.insert(oem.clone(), original.clone());
+                    current_oem = None;
+                    current_original = None;
+                }
+            }
+        }
+        
+        println!("Found {} INF mappings", lookup.len());
+        lookup
+    }
+
+    /// Export WMI driver info to CSV, grouped by driver version (collection)
+    fn export_wmi_drivers_csv_static(drivers: &[PnPSignedDriver], output_path: &Path, verbose: bool) -> Result<()> {
+        let escape_csv = |s: &str| -> String {
+            if s.contains(',') || s.contains('"') || s.contains('\n') {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.to_string()
+            }
+        };
+
+        // Build INF lookup table once
+        let inf_lookup = Self::build_inf_lookup();
+
+        // Group drivers by driver version (collection)
+        let mut grouped: HashMap<String, Vec<&PnPSignedDriver>> = HashMap::new();
+        for driver in drivers {
+            let version = driver.driver_version.as_deref().unwrap_or("Unknown").to_string();
+            grouped.entry(version).or_default().push(driver);
+        }
+
+        let mut csv_content = String::new();
+        csv_content.push_str("Collection,Device Class,Provider,Driver Version,Driver Date,Device Count,Actual INFs,Device Names,Hardware IDs\n");
+
+        // Sort by provider then version
+        let mut sorted_keys: Vec<_> = grouped.keys().cloned().collect();
+        sorted_keys.sort();
+
+        for version in &sorted_keys {
+            if let Some(drivers_for_version) = grouped.get(version) {
+                let first = drivers_for_version.first().unwrap();
+                
+                let driver_date = first.driver_date.as_ref()
+                    .map(|d| {
+                        if d.len() >= 8 && d[0..8].chars().all(|c| c.is_ascii_digit()) {
+                            format!("{}-{}-{}", &d[0..4], &d[4..6], &d[6..8])
+                        } else {
+                            d.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| "Unknown".to_string());
+
+                // Collect unique actual INF names
+                let mut actual_infs: Vec<String> = drivers_for_version.iter()
+                    .filter_map(|d| {
+                        let oem = d.inf_name.as_deref()?.to_lowercase();
+                        Some(inf_lookup.get(&oem).cloned().unwrap_or(oem))
+                    })
+                    .collect();
+                actual_infs.sort();
+                actual_infs.dedup();
+
+                // Collect device names and hardware IDs
+                let device_names: Vec<String> = drivers_for_version.iter()
+                    .filter_map(|d| d.device_name.clone())
+                    .collect();
+                let hardware_ids: Vec<String> = drivers_for_version.iter()
+                    .filter_map(|d| d.hardware_id.clone())
+                    .collect();
+
+                // Create collection name from provider + version
+                let provider = first.driver_provider_name.as_deref().unwrap_or("Unknown");
+                let collection_name = format!("{} {} Package", provider, version);
+
+                csv_content.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{}\n",
+                    escape_csv(&collection_name),
+                    escape_csv(first.device_class.as_deref().unwrap_or("Unknown")),
+                    escape_csv(provider),
+                    escape_csv(version),
+                    escape_csv(&driver_date),
+                    drivers_for_version.len(),
+                    escape_csv(&actual_infs.join("; ")),
+                    escape_csv(&device_names.join("; ")),
+                    escape_csv(&hardware_ids.join("; ")),
+                ));
+            }
+        }
+
+        fs::write(output_path, &csv_content)
+            .with_context(|| format!("Failed to write CSV file: {}", output_path.display()))?;
+
+        println!("CSV created: {}", output_path.display());
+        println!("Total collections: {}", grouped.len());
+        println!("Total devices: {}", drivers.len());
+
+        if verbose {
+            println!("\nDriver collections exported:");
+            for version in &sorted_keys {
+                if let Some(drivers_for_version) = grouped.get(version) {
+                    let first = drivers_for_version.first().unwrap();
+                    let provider = first.driver_provider_name.as_deref().unwrap_or("Unknown");
+                    println!("\n  {} {} - {} devices", provider, version, drivers_for_version.len());
+                    for driver in drivers_for_version {
+                        let oem = driver.inf_name.as_deref().unwrap_or("unknown").to_lowercase();
+                        let actual = inf_lookup.get(&oem).map(|s| s.as_str()).unwrap_or(&oem);
+                        println!("    - {} | {} | {}", 
+                            driver.device_name.as_deref().unwrap_or("Unknown"),
+                            driver.hardware_id.as_deref().unwrap_or("Unknown"),
+                            actual);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // INF Parser for extracting driver information from INF files
@@ -1377,6 +1526,24 @@ enum Commands {
         #[arg(short, long)]
         recursive: bool,
     },
+    /// Export connected device hardware IDs to CSV (no driver backup, just inventory)
+    Export {
+        /// Output directory (for driver files) or CSV file path
+        #[arg(short, long, default_value = "hardware_inventory.csv")]
+        output: PathBuf,
+
+        /// Include Microsoft drivers in export
+        #[arg(short, long)]
+        all: bool,
+
+        /// Show detailed output
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Also export driver files (like backup command)
+        #[arg(short, long)]
+        files: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1440,6 +1607,108 @@ fn main() -> Result<()> {
 
             // Run the scan process
             InfParser::scan_folder(&path, output.as_deref(), verbose, group, recursive)?;
+        }
+        Commands::Export { output, all, verbose, files } => {
+            println!("Hardware Inventory Export");
+            println!("=========================");
+            
+            // Query WMI for connected devices
+            let com_con = COMLibrary::new().context("Failed to initialize COM library")?;
+            let wmi_con = WMIConnection::new(com_con.into()).context("Failed to create WMI connection")?;
+            
+            let drivers: Vec<PnPSignedDriver> = wmi_con.query()
+                .context("Failed to query WMI for PnP signed drivers")?;
+            
+            // Filter Microsoft drivers unless --all is specified
+            let filtered_drivers: Vec<PnPSignedDriver> = if all {
+                drivers
+            } else {
+                drivers.into_iter()
+                    .filter(|d| {
+                        d.driver_provider_name.as_ref()
+                            .map(|p| !p.to_lowercase().contains("microsoft"))
+                            .unwrap_or(true)
+                    })
+                    .collect()
+            };
+            
+            println!("Found {} connected devices", filtered_drivers.len());
+
+            // Export driver files if --files flag is set
+            if files {
+                let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+                let backup_dir = if output.extension().map(|e| e == "csv").unwrap_or(false) {
+                    output.parent().unwrap_or(Path::new(".")).join(format!("drivers_{}", timestamp))
+                } else {
+                    output.join(format!("drivers_{}", timestamp))
+                };
+                
+                fs::create_dir_all(&backup_dir)
+                    .with_context(|| format!("Failed to create backup directory: {}", backup_dir.display()))?;
+
+                println!("\nExporting driver files to: {}", backup_dir.display());
+
+                // Group drivers by INF and export
+                let mut exported_infs: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut success_count = 0;
+                let mut fail_count = 0;
+
+                for driver in &filtered_drivers {
+                    if let Some(inf_name) = &driver.inf_name {
+                        let inf_lower = inf_name.to_lowercase();
+                        if inf_lower.starts_with("oem") && !exported_infs.contains(&inf_lower) {
+                            exported_infs.insert(inf_lower.clone());
+
+                            // Create folder for this driver
+                            let device_class = driver.device_class.as_deref().unwrap_or("Unknown");
+                            let version = driver.driver_version.as_deref().unwrap_or("Unknown");
+                            let provider = driver.driver_provider_name.as_deref().unwrap_or("Unknown");
+                            
+                            let folder_name = format!("{}_{}_{}",device_class, provider, version)
+                                .chars()
+                                .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+                                .collect::<String>();
+
+                            let driver_dir = backup_dir.join(&folder_name);
+                            fs::create_dir_all(&driver_dir).ok();
+
+                            if verbose {
+                                println!("  Exporting {} -> {}", inf_name, folder_name);
+                            }
+
+                            let status = Command::new("pnputil")
+                                .arg("/export-driver")
+                                .arg(inf_name)
+                                .arg(&driver_dir)
+                                .output();
+
+                            match status {
+                                Ok(result) if result.status.success() => {
+                                    success_count += 1;
+                                }
+                                _ => {
+                                    fail_count += 1;
+                                    if verbose {
+                                        eprintln!("    Failed to export {}", inf_name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                println!("Driver files exported: {} success, {} failed", success_count, fail_count);
+
+                // Create CSV in backup directory
+                let csv_path = backup_dir.join("all_drivers.csv");
+                DriverBackup::export_wmi_drivers_csv_static(&filtered_drivers, &csv_path, verbose)?;
+                
+                println!("\nBackup location: {}", backup_dir.display());
+            } else {
+                // Just export CSV
+                DriverBackup::export_wmi_drivers_csv_static(&filtered_drivers, &output, verbose)?;
+                println!("\nExported to: {}", output.display());
+            }
         }
     }
 
