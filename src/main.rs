@@ -1,12 +1,47 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::collections::HashMap;
 use wmi::{COMLibrary, WMIConnection};
+
+// Struct for parsed INF driver information (mirrors PnPSignedDriver structure)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InfDriverInfo {
+    device_name: Option<String>,
+    description: Option<String>,
+    device_class: Option<String>,
+    class_guid: Option<String>,
+    driver_version: Option<String>,
+    driver_date: Option<String>,
+    driver_provider_name: Option<String>,
+    hardware_id: Option<String>,
+    inf_name: Option<String>,
+    catalog_file: Option<String>,
+    manufacturer: Option<String>,
+}
+
+// Struct for parsed INF file
+#[derive(Debug, Clone)]
+struct ParsedInfFile {
+    file_path: PathBuf,
+    file_name: String,
+    drivers: Vec<InfDriverInfo>,
+    raw_version_info: InfVersionInfo,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InfVersionInfo {
+    driver_version: Option<String>,
+    driver_date: Option<String>,
+    class: Option<String>,
+    class_guid: Option<String>,
+    provider: Option<String>,
+    catalog_file: Option<String>,
+}
 
 // Original driver struct
 #[derive(Deserialize, Debug, Clone)]
@@ -311,9 +346,6 @@ impl DriverBackup {
                                             if matches!(self.args.command, Some(Commands::Backup { verbose, .. }) if verbose) {
                                                 println!("        ✓ Successfully exported: {}", oem_inf);
                                             }
-                                            
-                                            // Create CSV file for this driver package
-                                            self.create_driver_csv(&driver_backup_dir, drivers_for_package)?;
                                         } else {
                                             let stdout = String::from_utf8_lossy(&output.stdout);
                                             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -359,236 +391,22 @@ impl DriverBackup {
             }
         }
 
-        if let Some(Commands::Backup { dry_run, .. }) = &self.args.command {
-            if !dry_run {
-                self.create_summary_file(&base_backup_dir, &driver_info)?;
-                self.create_master_csv(&base_backup_dir, &driver_info)?;
-            }
-        }
-
-        println!("Driver backup process completed!");
+        println!("\nDriver export completed!");
         println!("Successfully exported: {} driver packages", backed_up_count);
         if failed_count > 0 {
             println!("Failed to export: {} drivers", failed_count);
         }
 
-        if let Some(Commands::Backup { dry_run, output, .. }) = &self.args.command {
+        if let Some(Commands::Backup { dry_run, verbose, .. }) = &self.args.command {
             if !dry_run {
-                println!("Backup location: {}", output.display());
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Create a CSV file for a specific driver package (for database upload)
-    fn create_driver_csv(&self, driver_dir: &Path, drivers: &[PnPSignedDriver]) -> Result<()> {
-        let csv_path = driver_dir.join("driver_info.csv");
-        let mut csv_content = String::new();
-        
-        // CSV Header
-        csv_content.push_str("Device Name,Driver Version,Driver Date,Hardware ID,Device ID,INF Name,Description,Provider,Device Class,Class GUID\n");
-        
-        for driver in drivers {
-            let device_name = driver.device_name.as_deref().unwrap_or("Unknown");
-            let driver_version = driver.driver_version.as_deref().unwrap_or("Unknown");
-            let driver_date = self.format_driver_date(&driver.driver_date);
-            let hardware_id = driver.hardware_id.as_deref().unwrap_or("Unknown");
-            let device_id = driver.device_id.as_deref().unwrap_or("Unknown");
-            let inf_name = driver.inf_name.as_deref().unwrap_or("Unknown");
-            let description = driver.description.as_deref().unwrap_or("Unknown");
-            let provider = driver.driver_provider_name.as_deref().unwrap_or("Unknown");
-            let device_class = driver.device_class.as_deref().unwrap_or("Unknown");
-            let class_guid = driver.class_guid.as_deref().unwrap_or("Unknown");
-            
-            // Escape CSV fields that might contain commas or quotes
-            let escape_csv = |s: &str| -> String {
-                if s.contains(',') || s.contains('"') || s.contains('\n') {
-                    format!("\"{}\"", s.replace("\"", "\"\""))
-                } else {
-                    s.to_string()
-                }
-            };
-            
-            csv_content.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{}\n",
-                escape_csv(device_name),
-                escape_csv(driver_version),
-                escape_csv(&driver_date),
-                escape_csv(hardware_id),
-                escape_csv(device_id),
-                escape_csv(inf_name),
-                escape_csv(description),
-                escape_csv(provider),
-                escape_csv(device_class),
-                escape_csv(class_guid)
-            ));
-        }
-        
-        fs::write(&csv_path, csv_content)
-            .with_context(|| format!("Failed to write CSV file: {}", csv_path.display()))?;
-        
-        if matches!(self.args.command, Some(Commands::Backup { verbose, .. }) if verbose) {
-            println!("      Created CSV file: {}", csv_path.display());
-        }
-        
-        Ok(())
-    }
-
-    /// Create a master CSV file with all driver information
-    fn create_master_csv(&self, backup_dir: &Path, drivers: &[PnPSignedDriver]) -> Result<()> {
-        let csv_path = backup_dir.join("all_drivers.csv");
-        let mut csv_content = String::new();
-        
-        // CSV Header
-        csv_content.push_str("Device Name,Driver Version,Driver Date,Hardware ID,Device ID,INF Name,Description,Provider,Device Class,Class GUID,Folder Name\n");
-        
-        for driver in drivers {
-            let device_name = driver.device_name.as_deref().unwrap_or("Unknown");
-            let driver_version = driver.driver_version.as_deref().unwrap_or("Unknown");
-            let driver_date = self.format_driver_date(&driver.driver_date);
-            let hardware_id = driver.hardware_id.as_deref().unwrap_or("Unknown");
-            let device_id = driver.device_id.as_deref().unwrap_or("Unknown");
-            let inf_name = driver.inf_name.as_deref().unwrap_or("Unknown");
-            let description = driver.description.as_deref().unwrap_or("Unknown");
-            let provider = driver.driver_provider_name.as_deref().unwrap_or("Unknown");
-            let device_class = driver.device_class.as_deref().unwrap_or("Unknown");
-            let class_guid = driver.class_guid.as_deref().unwrap_or("Unknown");
-            
-            // Create folder name based on device class/device name_version Package
-            let class_folder = device_class
-                .chars()
-                .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' })
-                .collect::<String>();
-            
-            let driver_folder = format!("{}_{} Package", device_name, driver_version)
-                .chars()
-                .map(|c| if c.is_alphanumeric() || c == ' ' || c == '.' || c == '-' || c == '_' || c == '(' || c == ')' { c } else { '_' })
-                .collect::<String>();
-            
-            let folder_name = format!("{}/{}", class_folder, driver_folder);
-            
-            // Escape CSV fields that might contain commas or quotes
-            let escape_csv = |s: &str| -> String {
-                if s.contains(',') || s.contains('"') || s.contains('\n') {
-                    format!("\"{}\"", s.replace("\"", "\"\""))
-                } else {
-                    s.to_string()
-                }
-            };
-            
-            csv_content.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{}\n",
-                escape_csv(device_name),
-                escape_csv(driver_version),
-                escape_csv(&driver_date),
-                escape_csv(hardware_id),
-                escape_csv(device_id),
-                escape_csv(inf_name),
-                escape_csv(description),
-                escape_csv(provider),
-                escape_csv(device_class),
-                escape_csv(class_guid),
-                escape_csv(&folder_name)
-            ));
-        }
-        
-        fs::write(&csv_path, csv_content)
-            .with_context(|| format!("Failed to write master CSV file: {}", csv_path.display()))?;
-        
-        if matches!(self.args.command, Some(Commands::Backup { verbose, .. }) if verbose) {
-            println!("Created master CSV file: {}", csv_path.display());
-        }
-        
-        Ok(())
-    }
-
-    /// Create a summary file with driver information
-    fn create_summary_file(&self, backup_dir: &Path, drivers: &[PnPSignedDriver]) -> Result<()> {
-        let summary_path = backup_dir.join("driver_backup_summary.txt");
-        let estimated_size = drivers.len() * 300 + 500;
-        let mut summary = String::with_capacity(estimated_size);
-
-        summary.push_str("Driver Export Summary\n");
-        summary.push_str(&format!("Generated: {}\n", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
-        summary.push_str(&format!("Total drivers exported: {}\n\n", drivers.len()));
-
-        // Group drivers by Device Class, then by INF file
-        let mut drivers_by_class_inf: HashMap<String, HashMap<String, Vec<&PnPSignedDriver>>> = HashMap::new();
-        for driver in drivers {
-            let device_class = driver.device_class.as_deref().unwrap_or("Unknown").to_string();
-            let inf = driver.inf_name.as_deref().unwrap_or("Unknown").to_string();
-            drivers_by_class_inf
-                .entry(device_class)
-                .or_default()
-                .entry(inf)
-                .or_default()
-                .push(driver);
-        }
-
-        // Sort device classes for consistent order
-        let mut sorted_classes: Vec<_> = drivers_by_class_inf.keys().collect();
-        sorted_classes.sort();
-
-        summary.push_str("Drivers by Device Class and Package:\n");
-        summary.push_str("=====================================\n\n");
-
-        let mut global_counter = 1;
-        for device_class in sorted_classes {
-            if let Some(infs_in_class) = drivers_by_class_inf.get(device_class) {
-                summary.push_str(&format!("=== {} ({} packages) ===\n\n", device_class, infs_in_class.len()));
+                println!("\nScanning exported drivers to create summary...");
                 
-                // Sort INF names within class
-                let mut sorted_infs: Vec<_> = infs_in_class.keys().collect();
-                sorted_infs.sort();
+                // Use InfParser to scan the backup folder and create summary CSV
+                let csv_path = base_backup_dir.join("all_drivers.csv");
+                InfParser::scan_and_export(&base_backup_dir, &csv_path, *verbose)?;
                 
-                for inf_name in sorted_infs {
-                    if let Some(inf_drivers) = infs_in_class.get(inf_name) {
-                        let primary_device = inf_drivers.first()
-                            .and_then(|d| d.device_name.as_deref())
-                            .unwrap_or("Unknown");
-                        let driver_version = inf_drivers.first()
-                            .and_then(|d| d.driver_version.as_deref())
-                            .unwrap_or("Unknown");
-                        
-                        let folder_name = format!("{}_{} Package", primary_device, driver_version)
-                            .chars()
-                            .map(|c| if c.is_alphanumeric() || c == ' ' || c == '.' || c == '-' || c == '_' || c == '(' || c == ')' { c } else { '_' })
-                            .collect::<String>();
-                        
-                        summary.push_str(&format!("{}. {} ({} devices in package):\n", global_counter, inf_name, inf_drivers.len()));
-                        summary.push_str(&format!("   Folder: {}/{}\n", device_class, folder_name));
-                        
-                        if let Some(first_driver) = inf_drivers.first() {
-                            summary.push_str(&format!("   Provider: {}\n", first_driver.driver_provider_name.as_deref().unwrap_or("Unknown")));
-                            summary.push_str(&format!("   Version: {}\n", first_driver.driver_version.as_deref().unwrap_or("Unknown")));
-                            summary.push_str(&format!("   Date: {}\n", self.format_driver_date(&first_driver.driver_date)));
-                        }
-                        
-                        summary.push_str("\n   Devices in this package:\n");
-                        for (idx, driver) in inf_drivers.iter().enumerate() {
-                            summary.push_str(&format!("   {}. {}\n", idx + 1, driver.device_name.as_deref().unwrap_or("Unknown")));
-                            summary.push_str(&format!("      Hardware ID: {}\n", driver.hardware_id.as_deref().unwrap_or("Unknown")));
-                            summary.push_str(&format!("      Device ID: {}\n", driver.device_id.as_deref().unwrap_or("Unknown")));
-                            summary.push_str(&format!("      Description: {}\n", driver.description.as_deref().unwrap_or("Unknown")));
-                        }
-                        summary.push('\n');
-                        global_counter += 1;
-                    }
-                }
-                summary.push('\n');
+                println!("\nBackup location: {}", base_backup_dir.display());
             }
-        }
-
-        fs::write(&summary_path, summary)
-            .with_context(|| format!("Failed to write summary file: {}", summary_path.display()))?;
-
-        if !summary_path.exists() {
-            anyhow::bail!("Summary file was not created successfully: {}", summary_path.display());
-        }
-
-        if matches!(self.args.command, Some(Commands::Backup { verbose, .. }) if verbose) {
-            println!("Created summary file: {}", summary_path.display());
         }
 
         Ok(())
@@ -612,10 +430,896 @@ impl DriverBackup {
     }
 }
 
+// INF Parser for extracting driver information from INF files
+struct InfParser;
+
+impl InfParser {
+    /// Extract driver package from installer (.exe, .zip) or use folder directly
+    fn extract_or_use_path(path: &Path, verbose: bool) -> Result<(PathBuf, bool)> {
+        if path.is_dir() {
+            return Ok((path.to_path_buf(), false));
+        }
+
+        let extension = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+
+        match extension.as_str() {
+            "exe" | "zip" | "7z" | "rar" => {
+                let temp_dir = std::env::temp_dir().join(format!("driver_inspect_{}", std::process::id()));
+                fs::create_dir_all(&temp_dir)?;
+
+                if verbose {
+                    println!("Extracting {} to {}...", path.display(), temp_dir.display());
+                }
+
+                // Try 7z first, then fall back to other methods
+                let extract_result = Self::extract_with_7z(path, &temp_dir)
+                    .or_else(|_| Self::extract_with_powershell(path, &temp_dir));
+
+                match extract_result {
+                    Ok(_) => {
+                        if verbose {
+                            println!("Successfully extracted to {}", temp_dir.display());
+                        }
+                        Ok((temp_dir, true))
+                    }
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&temp_dir);
+                        Err(e)
+                    }
+                }
+            }
+            "inf" => {
+                // Single INF file - use parent directory
+                Ok((path.parent().unwrap_or(Path::new(".")).to_path_buf(), false))
+            }
+            _ => anyhow::bail!("Unsupported file type: {}", extension)
+        }
+    }
+
+    fn extract_with_7z(archive: &Path, dest: &Path) -> Result<()> {
+        // Try common 7z locations
+        let seven_zip_paths = [
+            "7z",
+            "C:\\Program Files\\7-Zip\\7z.exe",
+            "C:\\Program Files (x86)\\7-Zip\\7z.exe",
+        ];
+
+        for seven_zip in &seven_zip_paths {
+            let output = Command::new(seven_zip)
+                .arg("x")
+                .arg("-y")
+                .arg(format!("-o{}", dest.display()))
+                .arg(archive)
+                .output();
+
+            if let Ok(result) = output {
+                if result.status.success() {
+                    return Ok(());
+                }
+            }
+        }
+
+        anyhow::bail!("7-Zip not found or extraction failed")
+    }
+
+    fn extract_with_powershell(archive: &Path, dest: &Path) -> Result<()> {
+        let extension = archive.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+
+        if extension == "zip" {
+            let output = Command::new("powershell")
+                .arg("-Command")
+                .arg(format!(
+                    "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                    archive.display(),
+                    dest.display()
+                ))
+                .output()?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!("PowerShell extraction failed or unsupported format")
+    }
+
+    /// Find all INF files in a directory recursively
+    fn find_inf_files(dir: &Path) -> Result<Vec<PathBuf>> {
+        let mut inf_files = Vec::new();
+        Self::find_inf_files_recursive(dir, &mut inf_files)?;
+        inf_files.sort();
+        Ok(inf_files)
+    }
+
+    /// Find INF files in a single folder (non-recursive)
+    fn find_inf_files_in_folder(dir: &Path) -> Result<Vec<PathBuf>> {
+        let mut inf_files = Vec::new();
+        
+        if !dir.is_dir() {
+            return Ok(inf_files);
+        }
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext.to_string_lossy().to_lowercase() == "inf" {
+                        inf_files.push(path);
+                    }
+                }
+            }
+        }
+
+        inf_files.sort();
+        Ok(inf_files)
+    }
+
+    fn find_inf_files_recursive(dir: &Path, inf_files: &mut Vec<PathBuf>) -> Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                Self::find_inf_files_recursive(&path, inf_files)?;
+            } else if let Some(ext) = path.extension() {
+                if ext.to_string_lossy().to_lowercase() == "inf" {
+                    inf_files.push(path);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse a single INF file
+    fn parse_inf_file(inf_path: &Path) -> Result<ParsedInfFile> {
+        // Try different encodings (INF files can be UTF-8, UTF-16, or ANSI)
+        let content = Self::read_inf_content(inf_path)?;
+        
+        let file_name = inf_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown.inf")
+            .to_string();
+
+        let mut version_info = InfVersionInfo::default();
+        let mut manufacturers: HashMap<String, String> = HashMap::new();
+        let mut device_sections: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut string_table: HashMap<String, String> = HashMap::new();
+        let mut current_section = String::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with(';') {
+                continue;
+            }
+
+            // Section header
+            if line.starts_with('[') && line.ends_with(']') {
+                current_section = line[1..line.len()-1].to_lowercase();
+                continue;
+            }
+
+            // Parse based on current section
+            match current_section.as_str() {
+                "version" => Self::parse_version_line(line, &mut version_info),
+                "manufacturer" => Self::parse_manufacturer_line(line, &mut manufacturers),
+                "strings" => Self::parse_strings_line(line, &mut string_table),
+                section if manufacturers.values().any(|v| {
+                    let sec_lower = section.to_lowercase();
+                    v.to_lowercase().starts_with(&sec_lower) || sec_lower.starts_with(&v.to_lowercase())
+                }) => {
+                    Self::parse_device_line(line, &current_section, &mut device_sections);
+                }
+                _ => {
+                    // Check if this is a device section
+                    for mfg_section in manufacturers.values() {
+                        let base_section = mfg_section.split(',').next().unwrap_or(mfg_section);
+                        if current_section.to_lowercase().starts_with(&base_section.to_lowercase()) {
+                            Self::parse_device_line(line, &current_section, &mut device_sections);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build driver info list
+        let mut drivers = Vec::new();
+        
+        for (section_name, devices) in &device_sections {
+            for (device_desc, hardware_id) in devices {
+                // Resolve string references
+                let resolved_desc = Self::resolve_string(device_desc, &string_table);
+                let resolved_provider = version_info.provider.as_ref()
+                    .map(|p| Self::resolve_string(p, &string_table));
+
+                // Find manufacturer for this section
+                let manufacturer = manufacturers.iter()
+                    .find(|(_, sec)| {
+                        let base = sec.split(',').next().unwrap_or(sec);
+                        section_name.to_lowercase().starts_with(&base.to_lowercase())
+                    })
+                    .map(|(name, _)| Self::resolve_string(name, &string_table));
+
+                let driver_info = InfDriverInfo {
+                    device_name: Some(resolved_desc.clone()),
+                    description: Some(resolved_desc),
+                    device_class: version_info.class.clone(),
+                    class_guid: version_info.class_guid.clone(),
+                    driver_version: version_info.driver_version.clone(),
+                    driver_date: version_info.driver_date.clone(),
+                    driver_provider_name: resolved_provider,
+                    hardware_id: Some(hardware_id.clone()),
+                    inf_name: Some(file_name.clone()),
+                    catalog_file: version_info.catalog_file.clone(),
+                    manufacturer,
+                };
+
+                drivers.push(driver_info);
+            }
+        }
+
+        Ok(ParsedInfFile {
+            file_path: inf_path.to_path_buf(),
+            file_name,
+            drivers,
+            raw_version_info: version_info,
+        })
+    }
+
+    fn read_inf_content(path: &Path) -> Result<String> {
+        // First try reading as bytes and detect encoding
+        let bytes = fs::read(path)?;
+        
+        // Check for UTF-16 LE BOM
+        if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+            let utf16_chars: Vec<u16> = bytes[2..]
+                .chunks(2)
+                .filter_map(|chunk| {
+                    if chunk.len() == 2 {
+                        Some(u16::from_le_bytes([chunk[0], chunk[1]]))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            return Ok(String::from_utf16_lossy(&utf16_chars));
+        }
+        
+        // Check for UTF-16 BE BOM
+        if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+            let utf16_chars: Vec<u16> = bytes[2..]
+                .chunks(2)
+                .filter_map(|chunk| {
+                    if chunk.len() == 2 {
+                        Some(u16::from_be_bytes([chunk[0], chunk[1]]))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            return Ok(String::from_utf16_lossy(&utf16_chars));
+        }
+
+        // Check for UTF-8 BOM
+        if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+            return Ok(String::from_utf8_lossy(&bytes[3..]).to_string());
+        }
+
+        // Try UTF-8, fall back to Windows-1252/Latin-1
+        match String::from_utf8(bytes.clone()) {
+            Ok(s) => Ok(s),
+            Err(_) => Ok(bytes.iter().map(|&b| b as char).collect())
+        }
+    }
+
+    fn parse_version_line(line: &str, version_info: &mut InfVersionInfo) {
+        let parts: Vec<&str> = line.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            return;
+        }
+
+        let key = parts[0].trim().to_lowercase();
+        let value = parts[1].trim().trim_matches('"').to_string();
+
+        match key.as_str() {
+            "driverver" => {
+                // Format: MM/DD/YYYY, version or YYYY/MM/DD, version
+                let dv_parts: Vec<&str> = value.splitn(2, ',').collect();
+                if !dv_parts.is_empty() {
+                    version_info.driver_date = Some(dv_parts[0].trim().to_string());
+                }
+                if dv_parts.len() > 1 {
+                    version_info.driver_version = Some(dv_parts[1].trim().to_string());
+                }
+            }
+            "class" => version_info.class = Some(value),
+            "classguid" => version_info.class_guid = Some(value),
+            "provider" => version_info.provider = Some(value),
+            "catalogfile" | "catalogfile.nt" | "catalogfile.ntamd64" | "catalogfile.ntx86" => {
+                version_info.catalog_file = Some(value);
+            }
+            _ => {}
+        }
+    }
+
+    fn parse_manufacturer_line(line: &str, manufacturers: &mut HashMap<String, String>) {
+        let parts: Vec<&str> = line.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            return;
+        }
+
+        let name = parts[0].trim().to_string();
+        let section = parts[1].trim().to_string();
+        manufacturers.insert(name, section);
+    }
+
+    fn parse_device_line(line: &str, section: &str, device_sections: &mut HashMap<String, Vec<(String, String)>>) {
+        let parts: Vec<&str> = line.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            return;
+        }
+
+        let device_desc = parts[0].trim().to_string();
+        let right_side = parts[1].trim();
+        
+        // Format: InstallSection, HardwareID [, CompatibleID, ...]
+        let hw_parts: Vec<&str> = right_side.split(',').collect();
+        if hw_parts.len() >= 2 {
+            let hardware_id = hw_parts[1].trim().to_string();
+            if !hardware_id.is_empty() && (
+                hardware_id.to_uppercase().starts_with("PCI\\") ||
+                hardware_id.to_uppercase().starts_with("USB\\") ||
+                hardware_id.to_uppercase().starts_with("HDAUDIO\\") ||
+                hardware_id.to_uppercase().starts_with("ACPI\\") ||
+                hardware_id.to_uppercase().starts_with("HID\\") ||
+                hardware_id.to_uppercase().starts_with("SWD\\") ||
+                hardware_id.to_uppercase().starts_with("ROOT\\") ||
+                hardware_id.to_uppercase().contains("VEN_") ||
+                hardware_id.to_uppercase().contains("DEV_")
+            ) {
+                device_sections
+                    .entry(section.to_string())
+                    .or_default()
+                    .push((device_desc, hardware_id));
+            }
+        }
+    }
+
+    fn parse_strings_line(line: &str, string_table: &mut HashMap<String, String>) {
+        let parts: Vec<&str> = line.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            return;
+        }
+
+        let key = parts[0].trim().to_string();
+        let value = parts[1].trim().trim_matches('"').to_string();
+        string_table.insert(key, value);
+    }
+
+    fn resolve_string(s: &str, string_table: &HashMap<String, String>) -> String {
+        if s.starts_with('%') && s.ends_with('%') && s.len() > 2 {
+            let key = &s[1..s.len()-1];
+            string_table.get(key).cloned().unwrap_or_else(|| s.to_string())
+        } else {
+            s.to_string()
+        }
+    }
+
+    /// Display parsed driver information
+    fn display_results(parsed_files: &[ParsedInfFile], verbose: bool) {
+        println!("\n========================================");
+        println!("       Driver Package Inspection");
+        println!("========================================\n");
+
+        let total_drivers: usize = parsed_files.iter().map(|f| f.drivers.len()).sum();
+        println!("Found {} INF files with {} device entries\n", parsed_files.len(), total_drivers);
+
+        for parsed in parsed_files {
+            println!("----------------------------------------");
+            println!("INF File: {}", parsed.file_name);
+            println!("Path: {}", parsed.file_path.display());
+            
+            if let Some(ref class) = parsed.raw_version_info.class {
+                println!("Device Class: {}", class);
+            }
+            if let Some(ref guid) = parsed.raw_version_info.class_guid {
+                println!("Class GUID: {}", guid);
+            }
+            if let Some(ref version) = parsed.raw_version_info.driver_version {
+                println!("Driver Version: {}", version);
+            }
+            if let Some(ref date) = parsed.raw_version_info.driver_date {
+                println!("Driver Date: {}", date);
+            }
+            if let Some(ref provider) = parsed.raw_version_info.provider {
+                println!("Provider: {}", provider);
+            }
+            if let Some(ref catalog) = parsed.raw_version_info.catalog_file {
+                println!("Catalog File: {}", catalog);
+            }
+
+            if !parsed.drivers.is_empty() {
+                println!("\nSupported Devices ({}):", parsed.drivers.len());
+                for (idx, driver) in parsed.drivers.iter().enumerate() {
+                    println!("\n  {}. {}", idx + 1, driver.device_name.as_deref().unwrap_or("Unknown"));
+                    println!("     Hardware ID: {}", driver.hardware_id.as_deref().unwrap_or("Unknown"));
+                    if verbose {
+                        if let Some(ref mfg) = driver.manufacturer {
+                            println!("     Manufacturer: {}", mfg);
+                        }
+                        if let Some(ref desc) = driver.description {
+                            if desc != driver.device_name.as_deref().unwrap_or("") {
+                                println!("     Description: {}", desc);
+                            }
+                        }
+                    }
+                }
+            } else {
+                println!("\nNo device entries found in this INF file.");
+            }
+            println!();
+        }
+    }
+
+    /// Export results to CSV
+    fn export_to_csv(parsed_files: &[ParsedInfFile], output_path: &Path) -> Result<()> {
+        let mut csv_content = String::new();
+        
+        // CSV Header matching PnPSignedDriver structure
+        csv_content.push_str("Device Name,Driver Version,Driver Date,Hardware ID,INF Name,Description,Provider,Device Class,Class GUID,Catalog File,Manufacturer\n");
+        
+        let escape_csv = |s: &str| -> String {
+            if s.contains(',') || s.contains('"') || s.contains('\n') {
+                format!("\"{}\"", s.replace("\"", "\"\""))
+            } else {
+                s.to_string()
+            }
+        };
+
+        for parsed in parsed_files {
+            for driver in &parsed.drivers {
+                csv_content.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{}\n",
+                    escape_csv(driver.device_name.as_deref().unwrap_or("Unknown")),
+                    escape_csv(driver.driver_version.as_deref().unwrap_or("Unknown")),
+                    escape_csv(driver.driver_date.as_deref().unwrap_or("Unknown")),
+                    escape_csv(driver.hardware_id.as_deref().unwrap_or("Unknown")),
+                    escape_csv(driver.inf_name.as_deref().unwrap_or("Unknown")),
+                    escape_csv(driver.description.as_deref().unwrap_or("Unknown")),
+                    escape_csv(driver.driver_provider_name.as_deref().unwrap_or("Unknown")),
+                    escape_csv(driver.device_class.as_deref().unwrap_or("Unknown")),
+                    escape_csv(driver.class_guid.as_deref().unwrap_or("Unknown")),
+                    escape_csv(driver.catalog_file.as_deref().unwrap_or("Unknown")),
+                    escape_csv(driver.manufacturer.as_deref().unwrap_or("Unknown")),
+                ));
+            }
+        }
+
+        fs::write(output_path, csv_content)
+            .with_context(|| format!("Failed to write CSV file: {}", output_path.display()))?;
+
+        println!("Exported to: {}", output_path.display());
+        Ok(())
+    }
+
+    /// Main inspect function
+    fn inspect(path: &Path, output: Option<&Path>, verbose: bool) -> Result<()> {
+        println!("Inspecting driver package: {}", path.display());
+
+        // Extract or use path directly
+        let (work_dir, needs_cleanup) = Self::extract_or_use_path(path, verbose)?;
+
+        // Find all INF files
+        let inf_files = Self::find_inf_files(&work_dir)?;
+
+        if inf_files.is_empty() {
+            if needs_cleanup {
+                let _ = fs::remove_dir_all(&work_dir);
+            }
+            anyhow::bail!("No INF files found in the specified path");
+        }
+
+        if verbose {
+            println!("Found {} INF files", inf_files.len());
+        }
+
+        // Parse all INF files
+        let mut parsed_files = Vec::new();
+        for inf_path in &inf_files {
+            match Self::parse_inf_file(inf_path) {
+                Ok(parsed) => parsed_files.push(parsed),
+                Err(e) => {
+                    if verbose {
+                        eprintln!("Warning: Failed to parse {}: {}", inf_path.display(), e);
+                    }
+                }
+            }
+        }
+
+        // Display results
+        Self::display_results(&parsed_files, verbose);
+
+        // Export to CSV if requested
+        if let Some(csv_path) = output {
+            Self::export_to_csv(&parsed_files, csv_path)?;
+        }
+
+        // Cleanup temp directory if needed
+        if needs_cleanup {
+            if verbose {
+                println!("Cleaning up temporary files...");
+            }
+            let _ = fs::remove_dir_all(&work_dir);
+        }
+
+        Ok(())
+    }
+
+    /// Scan folder and display INF summary
+    fn scan_folder(path: &Path, output: Option<&Path>, verbose: bool, group_by_class: bool, recursive: bool) -> Result<()> {
+        if !path.is_dir() {
+            anyhow::bail!("Path must be a directory: {}", path.display());
+        }
+
+        println!("Scanning folder: {}", path.display());
+        if recursive {
+            println!("Mode: Recursive (including subfolders)");
+        }
+        println!();
+
+        // Find all INF files
+        let inf_files = if recursive {
+            Self::find_inf_files(path)?
+        } else {
+            Self::find_inf_files_in_folder(path)?
+        };
+
+        if inf_files.is_empty() {
+            println!("No INF files found.");
+            return Ok(());
+        }
+
+        // Parse all INF files
+        let mut parsed_files: Vec<ParsedInfFile> = Vec::new();
+        let mut parse_errors: Vec<(PathBuf, String)> = Vec::new();
+
+        for inf_path in &inf_files {
+            match Self::parse_inf_file(inf_path) {
+                Ok(parsed) => parsed_files.push(parsed),
+                Err(e) => parse_errors.push((inf_path.clone(), e.to_string())),
+            }
+        }
+
+        // Display summary
+        println!("========================================");
+        println!("         INF Folder Scan Results");
+        println!("========================================");
+        println!();
+        println!("Folder: {}", path.display());
+        println!("Total INF files found: {}", inf_files.len());
+        println!("Successfully parsed: {}", parsed_files.len());
+        if !parse_errors.is_empty() {
+            println!("Failed to parse: {}", parse_errors.len());
+        }
+        
+        let total_devices: usize = parsed_files.iter().map(|f| f.drivers.len()).sum();
+        println!("Total device entries: {}", total_devices);
+        println!();
+
+        if group_by_class {
+            Self::display_scan_grouped(&parsed_files, verbose);
+        } else {
+            Self::display_scan_list(&parsed_files, verbose);
+        }
+
+        // Show parse errors if verbose
+        if verbose && !parse_errors.is_empty() {
+            println!("\n----------------------------------------");
+            println!("Parse Errors:");
+            for (path, error) in &parse_errors {
+                println!("  - {}: {}", path.file_name().unwrap_or_default().to_string_lossy(), error);
+            }
+        }
+
+        // Export to CSV if requested
+        if let Some(csv_path) = output {
+            Self::export_scan_csv(&parsed_files, csv_path)?;
+        }
+
+        Ok(())
+    }
+
+    /// Display scan results as a simple list
+    fn display_scan_list(parsed_files: &[ParsedInfFile], verbose: bool) {
+        println!("----------------------------------------");
+        println!("INF Files Summary:");
+        println!("----------------------------------------");
+        
+        for (idx, parsed) in parsed_files.iter().enumerate() {
+            println!("\n{}. {}", idx + 1, parsed.file_name);
+            
+            if let Some(ref class) = parsed.raw_version_info.class {
+                println!("   Class: {}", class);
+            }
+            if let Some(ref version) = parsed.raw_version_info.driver_version {
+                println!("   Version: {}", version);
+            }
+            if let Some(ref date) = parsed.raw_version_info.driver_date {
+                println!("   Date: {}", date);
+            }
+            if let Some(ref provider) = parsed.raw_version_info.provider {
+                // Resolve provider string if it's a reference
+                let provider_display = if provider.starts_with('%') && provider.ends_with('%') {
+                    // Try to find in first driver's manufacturer or use as-is
+                    parsed.drivers.first()
+                        .and_then(|d| d.driver_provider_name.as_ref())
+                        .map(|s| s.as_str())
+                        .unwrap_or(provider)
+                } else {
+                    provider
+                };
+                println!("   Provider: {}", provider_display);
+            }
+            println!("   Devices: {} entries", parsed.drivers.len());
+
+            if verbose && !parsed.drivers.is_empty() {
+                println!("   Hardware IDs:");
+                for driver in &parsed.drivers {
+                    if let Some(ref hwid) = driver.hardware_id {
+                        let device_name = driver.device_name.as_deref().unwrap_or("Unknown");
+                        println!("     - {} ({})", hwid, device_name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Display scan results grouped by device class
+    fn display_scan_grouped(parsed_files: &[ParsedInfFile], verbose: bool) {
+        // Group by device class
+        let mut by_class: HashMap<String, Vec<&ParsedInfFile>> = HashMap::new();
+        
+        for parsed in parsed_files {
+            let class = parsed.raw_version_info.class
+                .as_deref()
+                .unwrap_or("Unknown")
+                .to_string();
+            by_class.entry(class).or_default().push(parsed);
+        }
+
+        // Sort classes
+        let mut classes: Vec<_> = by_class.keys().cloned().collect();
+        classes.sort();
+
+        println!("----------------------------------------");
+        println!("INF Files by Device Class:");
+        println!("----------------------------------------");
+
+        for class in classes {
+            if let Some(files) = by_class.get(&class) {
+                println!("\n[{}] ({} INF files)", class, files.len());
+                
+                for parsed in files {
+                    let version = parsed.raw_version_info.driver_version
+                        .as_deref()
+                        .unwrap_or("?");
+                    let devices = parsed.drivers.len();
+                    
+                    println!("  - {} (v{}, {} devices)", parsed.file_name, version, devices);
+                    
+                    if verbose {
+                        for driver in &parsed.drivers {
+                            if let Some(ref hwid) = driver.hardware_id {
+                                println!("      HWID: {}", hwid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Export scan results to CSV
+    fn export_scan_csv(parsed_files: &[ParsedInfFile], output_path: &Path) -> Result<()> {
+        let mut csv_content = String::new();
+        
+        // CSV Header - summary format with device names
+        csv_content.push_str("INF File,Device Class,Provider,Driver Version,Driver Date,Device Count,Device Names,Hardware IDs\n");
+        
+        let escape_csv = |s: &str| -> String {
+            if s.contains(',') || s.contains('"') || s.contains('\n') {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.to_string()
+            }
+        };
+
+        for parsed in parsed_files {
+            // Collect device names
+            let device_names: Vec<String> = parsed.drivers
+                .iter()
+                .filter_map(|d| d.device_name.clone())
+                .collect();
+            let device_names_str = device_names.join("; ");
+
+            // Collect hardware IDs
+            let hwids: Vec<String> = parsed.drivers
+                .iter()
+                .filter_map(|d| d.hardware_id.clone())
+                .collect();
+            let hwids_str = hwids.join("; ");
+
+            // Resolve provider - try to get from parsed drivers first
+            let provider = parsed.raw_version_info.provider.as_deref().unwrap_or("Unknown");
+            let resolved_provider = if provider.starts_with('%') && provider.ends_with('%') {
+                // Get resolved provider from first driver
+                parsed.drivers.first()
+                    .and_then(|d| d.driver_provider_name.as_deref())
+                    .unwrap_or(provider)
+            } else {
+                provider
+            };
+
+            csv_content.push_str(&format!(
+                "{},{},{},{},{},{},{},{}\n",
+                escape_csv(&parsed.file_name),
+                escape_csv(parsed.raw_version_info.class.as_deref().unwrap_or("Unknown")),
+                escape_csv(resolved_provider),
+                escape_csv(parsed.raw_version_info.driver_version.as_deref().unwrap_or("Unknown")),
+                escape_csv(parsed.raw_version_info.driver_date.as_deref().unwrap_or("Unknown")),
+                parsed.drivers.len(),
+                escape_csv(&device_names_str),
+                escape_csv(&hwids_str),
+            ));
+        }
+
+        fs::write(output_path, csv_content)
+            .with_context(|| format!("Failed to write CSV file: {}", output_path.display()))?;
+
+        println!("\nExported to: {}", output_path.display());
+        Ok(())
+    }
+
+    /// Scan backup folder recursively and export summary CSV (used by backup command)
+    fn scan_and_export(backup_dir: &Path, output_csv: &Path, verbose: bool) -> Result<()> {
+        // Find all INF files recursively in the backup folder
+        let inf_files = Self::find_inf_files(backup_dir)?;
+
+        if inf_files.is_empty() {
+            println!("No INF files found in backup folder.");
+            return Ok(());
+        }
+
+        if verbose {
+            println!("Found {} INF files in backup", inf_files.len());
+        }
+
+        // Parse all INF files
+        let mut parsed_files: Vec<ParsedInfFile> = Vec::new();
+        for inf_path in &inf_files {
+            match Self::parse_inf_file(inf_path) {
+                Ok(parsed) => parsed_files.push(parsed),
+                Err(e) => {
+                    if verbose {
+                        eprintln!("Warning: Failed to parse {}: {}", inf_path.display(), e);
+                    }
+                }
+            }
+        }
+
+        if parsed_files.is_empty() {
+            println!("No valid INF files parsed.");
+            return Ok(());
+        }
+
+        // Export to CSV with folder name
+        Self::export_backup_summary_csv(&parsed_files, backup_dir, output_csv)?;
+
+        println!("Summary CSV created: {}", output_csv.display());
+        println!("Total INF files: {}", parsed_files.len());
+        
+        let total_devices: usize = parsed_files.iter().map(|f| f.drivers.len()).sum();
+        println!("Total device entries: {}", total_devices);
+
+        Ok(())
+    }
+
+    /// Export backup summary to CSV with relative folder paths
+    fn export_backup_summary_csv(parsed_files: &[ParsedInfFile], backup_dir: &Path, output_path: &Path) -> Result<()> {
+        let mut csv_content = String::new();
+        
+        // CSV Header - includes Folder Name for backup
+        csv_content.push_str("INF File,Device Class,Provider,Driver Version,Driver Date,Device Count,Folder Name,Device Names,Hardware IDs\n");
+        
+        let escape_csv = |s: &str| -> String {
+            if s.contains(',') || s.contains('"') || s.contains('\n') {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.to_string()
+            }
+        };
+
+        for parsed in parsed_files {
+            // Collect device names
+            let device_names: Vec<String> = parsed.drivers
+                .iter()
+                .filter_map(|d| d.device_name.clone())
+                .collect();
+            let device_names_str = device_names.join("; ");
+
+            // Collect hardware IDs
+            let hwids: Vec<String> = parsed.drivers
+                .iter()
+                .filter_map(|d| d.hardware_id.clone())
+                .collect();
+            let hwids_str = hwids.join("; ");
+
+            // Resolve provider
+            let provider = parsed.raw_version_info.provider.as_deref().unwrap_or("Unknown");
+            let resolved_provider = if provider.starts_with('%') && provider.ends_with('%') {
+                parsed.drivers.first()
+                    .and_then(|d| d.driver_provider_name.as_deref())
+                    .unwrap_or(provider)
+            } else {
+                provider
+            };
+
+            // Get relative folder path from backup_dir
+            let folder_name = parsed.file_path.parent()
+                .and_then(|p| p.strip_prefix(backup_dir).ok())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            csv_content.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{}\n",
+                escape_csv(&parsed.file_name),
+                escape_csv(parsed.raw_version_info.class.as_deref().unwrap_or("Unknown")),
+                escape_csv(resolved_provider),
+                escape_csv(parsed.raw_version_info.driver_version.as_deref().unwrap_or("Unknown")),
+                escape_csv(parsed.raw_version_info.driver_date.as_deref().unwrap_or("Unknown")),
+                parsed.drivers.len(),
+                escape_csv(&folder_name),
+                escape_csv(&device_names_str),
+                escape_csv(&hwids_str),
+            ));
+        }
+
+        fs::write(output_path, csv_content)
+            .with_context(|| format!("Failed to write CSV file: {}", output_path.display()))?;
+
+        Ok(())
+    }
+}
+
 // Add CLI arguments for backup functionality
 #[derive(Parser)]
 #[command(name = "driver-backup")]
-#[command(about = "A tool to backup and manage non-Microsoft drivers")]
+#[command(version = "2.3")]
+#[command(about = "A tool to backup, inspect, and manage non-Microsoft drivers")]
+#[command(long_about = "Driver Backup Tool v2.3\n\n\
+    Commands:\n  \
+    backup   - Export all non-Microsoft drivers from the system (requires Admin)\n  \
+    inspect  - Extract driver info from installer packages (.exe, .zip, .7z, folder)\n  \
+    scan     - Identify and list all INF files in a folder\n\n\
+    Examples:\n  \
+    driver-backup backup -o D:\\Backup -v\n  \
+    driver-backup inspect -p C:\\Downloads\\driver.exe -o info.csv\n  \
+    driver-backup scan -p C:\\Drivers -r -g -o inventory.csv")]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -623,16 +1327,55 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Backup drivers to specified directory
+    /// Export all non-Microsoft drivers from the system (requires Administrator)
     Backup {
+        /// Output directory for backup
         #[arg(short, long, default_value = "driver_backup")]
         output: PathBuf,
 
+        /// Enable verbose output with detailed logging
         #[arg(short, long)]
         verbose: bool,
 
+        /// Preview operations without actually exporting drivers
         #[arg(short, long)]
         dry_run: bool,
+    },
+    /// Extract driver information from installer package (.exe, .zip, .7z) or folder
+    Inspect {
+        /// Path to driver installer (.exe, .zip, .7z, .rar) or folder containing INF files
+        #[arg(short, long)]
+        path: PathBuf,
+
+        /// Export results to CSV file
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Show detailed output including all device entries
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Scan a folder to identify and list all INF files with summary
+    Scan {
+        /// Path to folder containing INF files
+        #[arg(short, long)]
+        path: PathBuf,
+
+        /// Export results to CSV file
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Show detailed information including all Hardware IDs
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Group results by device class (Display, Net, Media, etc.)
+        #[arg(short, long)]
+        group: bool,
+
+        /// Include all subfolders in scan (recursive)
+        #[arg(short, long)]
+        recursive: bool,
     },
 }
 
@@ -667,6 +1410,36 @@ fn main() -> Result<()> {
 
             // Run the backup process
             tokio::runtime::Runtime::new()?.block_on(backup.run())?;
+        }
+        Commands::Inspect { path, output, verbose } => {
+            if verbose {
+                println!("Driver Package Inspector");
+                println!("========================");
+                println!("Input path: {}", path.display());
+                if let Some(ref out) = output {
+                    println!("Output CSV: {}", out.display());
+                }
+                println!();
+            }
+
+            // Run the inspect process
+            InfParser::inspect(&path, output.as_deref(), verbose)?;
+        }
+        Commands::Scan { path, output, verbose, group, recursive } => {
+            if verbose {
+                println!("INF Folder Scanner");
+                println!("==================");
+                println!("Folder: {}", path.display());
+                if let Some(ref out) = output {
+                    println!("Output CSV: {}", out.display());
+                }
+                println!("Group by class: {}", group);
+                println!("Recursive: {}", recursive);
+                println!();
+            }
+
+            // Run the scan process
+            InfParser::scan_folder(&path, output.as_deref(), verbose, group, recursive)?;
         }
     }
 
