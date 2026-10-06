@@ -465,6 +465,15 @@ pub fn is_placeholder_class(class: &str) -> bool {
     lower.contains("todo") || lower.contains("unknown") || lower.trim().is_empty()
 }
 
+/// Normalize a device class for display in the manifest: canonical casing and
+/// placeholder classes (e.g. `System ; TODO: edit Class`) reduced to `Unknown`.
+pub fn manifest_class_name(class: Option<&str>) -> String {
+    match class {
+        Some(c) if !is_placeholder_class(c) => canonical_class_name(c.trim()),
+        _ => "Unknown".to_string(),
+    }
+}
+
 /// Maximum number of entries listed in a manifest row before summarising.
 pub const MAX_MANIFEST_LIST: usize = 10;
 
@@ -727,5 +736,31 @@ mod tests {
     fn provider_key_is_humanised() {
         assert_eq!(clean_provider_key("PROVIDER_NAME"), "Provider Name");
         assert_eq!(clean_provider_key("Mfg"), "Mfg");
+    }
+
+    #[test]
+    fn manifest_class_normalises_placeholders_and_casing() {
+        assert_eq!(manifest_class_name(Some("net")), "Net");
+        assert_eq!(
+            manifest_class_name(Some("System ; TODO: edit Class")),
+            "Unknown"
+        );
+        assert_eq!(
+            manifest_class_name(Some("System ; TODO: specify appropriate Class")),
+            "Unknown"
+        );
+        assert_eq!(manifest_class_name(None), "Unknown");
+        assert_eq!(manifest_class_name(Some("MEDIA")), "MEDIA");
+    }
+
+    #[test]
+    fn clean_version_strips_todo_suffix() {
+        assert_eq!(
+            clean_version(Some(
+                "1.0.0.16; TODO: set DriverVer in stampinf property pages"
+            )),
+            "1.0.0.16"
+        );
+        assert_eq!(clean_version(None), "NoVersion");
     }
 }

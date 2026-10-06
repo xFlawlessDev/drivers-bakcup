@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.5.3 - Manifest Consistency
+
+### Fixed
+
+- `manifest.csv` now stores the **normalized** device class and driver version
+  instead of the raw INF values. Placeholder classes such as
+  `System ; TODO: edit Class` become `Unknown`, `stampinf` version suffixes are
+  stripped, and class casing is canonical. This makes the CSV columns match the
+  generated folder names.
+
 ## v2.5.2 - Pack Merging, Flat Layout, Hardware IDs
 
 ### Changed

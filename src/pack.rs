@@ -21,8 +21,8 @@ use crate::csv_export::{
 };
 use crate::models::{PackDriver, PackMetadata};
 use crate::pack_discover::{
-    count_tree, discover_drivers, discover_installer_only_categories, format_device_names,
-    format_hardware_ids, normalized_folder_name,
+    clean_version, count_tree, discover_drivers, discover_installer_only_categories,
+    format_device_names, format_hardware_ids, manifest_class_name, normalized_folder_name,
 };
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -236,15 +236,9 @@ fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
                 .category
                 .clone()
                 .unwrap_or_else(|| "Uncategorized".to_string()),
-            device_class: driver
-                .device_class
-                .clone()
-                .unwrap_or_else(|| "Unknown".to_string()),
+            device_class: manifest_class_name(driver.device_class.as_deref()),
             driver_name: crate::util::strip_inf_extension(&driver.inf_name).to_string(),
-            driver_version: driver
-                .driver_version
-                .clone()
-                .unwrap_or_else(|| "Unknown".to_string()),
+            driver_version: clean_version(driver.driver_version.as_deref()),
             provider: driver
                 .provider
                 .clone()
