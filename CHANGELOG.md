@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.5.1 - Device Names in Pack Manifest
+
+### Added
+
+- `pack` manifest now includes `Device Name Count` and `Device Names` columns,
+  listing the unique friendly device names each INF supports (capped at 10 with
+  a `+N more` suffix so GPU/chipset packages with hundreds of devices stay
+  readable).
+
+### Fixed
+
+- INF string values that concatenate adjacent quoted segments (e.g.
+  `"Intel(R) UHD Graphics" "710"`) are now joined correctly, so stray quotes no
+  longer leak into device names.
+
 ## v2.5 - Driver Pack Normalizer
 
 ### Added

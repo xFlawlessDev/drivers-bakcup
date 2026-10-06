@@ -289,7 +289,9 @@ One row per discovered package.
 | `Driver Name` | INF file name without extension |
 | `Driver Version` | Version from the INF |
 | `Provider` | Driver publisher |
-| `Device Count` | Devices the INF declares |
+| `Device Count` | Number of device entries the INF declares |
+| `Device Name Count` | Number of unique friendly device names |
+| `Device Names` | Up to 10 unique device names, then `+N more` |
 | `Normalized Folder` | Destination path within the pack |
 | `Source Folder` | Original path in the source pack |
 | `File Count` / `Total Bytes` | Package size |

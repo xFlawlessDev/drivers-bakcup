@@ -58,6 +58,16 @@ pub fn discover_drivers(source: &Path, verbose: bool) -> Result<Vec<PackDriver>>
         let device_class = parsed.raw_version_info.class.clone();
         let category = resolve_category(source, &source_dir, device_class.as_deref());
 
+        // Unique, sorted friendly device names for the manifest.
+        let mut device_names: Vec<String> = parsed
+            .drivers
+            .iter()
+            .filter_map(|d| d.device_name.clone())
+            .filter(|n| !n.trim().is_empty())
+            .collect();
+        device_names.sort();
+        device_names.dedup();
+
         drivers.push(PackDriver {
             category: Some(category),
             source_dir,
@@ -66,6 +76,7 @@ pub fn discover_drivers(source: &Path, verbose: bool) -> Result<Vec<PackDriver>>
             driver_version: parsed.raw_version_info.driver_version.clone(),
             provider: parsed.raw_version_info.provider.clone(),
             device_count: parsed.drivers.len(),
+            device_names,
             inf_hash,
             files,
             total_bytes,
@@ -365,6 +376,29 @@ pub fn is_placeholder_class(class: &str) -> bool {
     lower.contains("todo") || lower.contains("unknown") || lower.trim().is_empty()
 }
 
+/// Maximum number of device names listed in a manifest row before summarising.
+pub const MAX_MANIFEST_DEVICE_NAMES: usize = 10;
+
+/// Format a package's device names for the manifest.
+///
+/// Names are already unique and sorted. At most [`MAX_MANIFEST_DEVICE_NAMES`]
+/// are listed; the remainder is summarised as `+N more` so packages with
+/// hundreds of devices (e.g. GPU INFs) stay readable.
+pub fn format_device_names(names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    if names.len() <= MAX_MANIFEST_DEVICE_NAMES {
+        return names.join("; ");
+    }
+    let shown = names[..MAX_MANIFEST_DEVICE_NAMES].join("; ");
+    format!(
+        "{}; +{} more",
+        shown,
+        names.len() - MAX_MANIFEST_DEVICE_NAMES
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +420,7 @@ mod tests {
             driver_version: Some(version.to_string()),
             provider: Some("Intel".to_string()),
             device_count: 1,
+            device_names: vec!["Intel(R) UHD Graphics".to_string()],
             category: Some(category.to_string()),
             inf_hash: hash.to_string(),
             files: vec![PathBuf::from(inf)],
@@ -476,5 +511,24 @@ mod tests {
             Some("System"),
         );
         assert_eq!(class, "01_Chipset");
+    }
+
+    #[test]
+    fn device_names_short_list_is_joined() {
+        let names = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(format_device_names(&names), "A; B");
+    }
+
+    #[test]
+    fn device_names_long_list_is_capped() {
+        let names: Vec<String> = (0..25).map(|i| format!("Dev{}", i)).collect();
+        let out = format_device_names(&names);
+        assert!(out.ends_with("+15 more"));
+        assert!(out.starts_with("Dev0; Dev1"));
+    }
+
+    #[test]
+    fn device_names_empty() {
+        assert_eq!(format_device_names(&[]), "");
     }
 }

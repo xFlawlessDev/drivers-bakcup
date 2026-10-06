@@ -138,6 +138,8 @@ pub struct PackDriver {
     pub provider: Option<String>,
     /// Number of device entries the INF declares.
     pub device_count: usize,
+    /// Unique friendly device names the INF supports, sorted.
+    pub device_names: Vec<String>,
     /// Top-level pack category the driver was found under, e.g. `01_Chipset`.
     pub category: Option<String>,
     /// SHA-256 of the INF file contents, used for duplicate detection.

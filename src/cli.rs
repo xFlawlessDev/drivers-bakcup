@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "driver-backup")]
-#[command(version = "2.5")]
+#[command(version = "2.5.1")]
 #[command(about = "A tool to backup, inspect, and manage non-Microsoft drivers")]
-#[command(long_about = "Driver Backup Tool v2.5\n\n\
+#[command(long_about = "Driver Backup Tool v2.5.1\n\n\
     Commands:\n  \
     backup   - Export all non-Microsoft drivers from the system (requires Admin)\n  \
     inspect  - Extract driver info from installer packages (.exe, .zip, .7z, folder)\n  \

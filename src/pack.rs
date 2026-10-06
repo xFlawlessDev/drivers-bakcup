@@ -21,7 +21,8 @@ use crate::csv_export::{
 };
 use crate::models::{PackDriver, PackMetadata};
 use crate::pack_discover::{
-    count_tree, discover_drivers, discover_installer_only_categories, normalized_folder_name,
+    count_tree, discover_drivers, discover_installer_only_categories, format_device_names,
+    normalized_folder_name,
 };
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -165,6 +166,8 @@ fn plan_layout(
                 .clone()
                 .unwrap_or_else(|| "Unknown".to_string()),
             device_count: driver.device_count,
+            device_names: format_device_names(&driver.device_names),
+            device_name_count: driver.device_names.len(),
             normalized_folder: normalized_rel,
             source_folder: source_rel,
             file_count: driver.files.len(),
@@ -203,6 +206,8 @@ fn append_installer_only_rows(
             driver_version: "None".to_string(),
             provider: String::new(),
             device_count: 0,
+            device_names: String::new(),
+            device_name_count: 0,
             normalized_folder: format!("Drivers/{}", name),
             source_folder: relative_path_str(dir),
             file_count,
@@ -366,6 +371,7 @@ mod tests {
             driver_version: Some(version.to_string()),
             provider: Some("Intel".to_string()),
             device_count: 1,
+            device_names: vec!["Intel(R) UHD Graphics".to_string()],
             category: Some(category.to_string()),
             inf_hash: hash.to_string(),
             files: vec![PathBuf::from(inf)],
@@ -440,6 +446,21 @@ mod tests {
         o.dedup = false;
         let (rows, _) = plan_layout(&ds, &o);
         assert!(rows.iter().all(|r| r.status == "unique"));
+    }
+
+    #[test]
+    fn manifest_row_includes_device_names() {
+        let ds = vec![driver(
+            "03_VGA",
+            Path::new("src/a"),
+            "iigd_dch.inf",
+            "Display",
+            "32.0.101.6556",
+            "h",
+        )];
+        let (rows, _) = plan_layout(&ds, &opts());
+        assert_eq!(rows[0].device_names, "Intel(R) UHD Graphics");
+        assert_eq!(rows[0].device_name_count, 1);
     }
 
     #[test]

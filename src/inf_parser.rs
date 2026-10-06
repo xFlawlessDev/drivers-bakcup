@@ -210,7 +210,7 @@ fn parse_version_line(line: &str, version_info: &mut InfVersionInfo) {
     }
 
     let key = parts[0].trim().to_lowercase();
-    let value = parts[1].trim().trim_matches('"').to_string();
+    let value = unquote_inf_value(parts[1]);
 
     match key.as_str() {
         "driverver" => {
@@ -282,9 +282,40 @@ fn is_hardware_id(hardware_id: &str) -> bool {
 
 fn parse_strings_line(line: &str, string_table: &mut HashMap<String, String>) {
     if let Some((key, value)) = split_kv(line) {
-        let value = value.trim_matches('"').to_string();
-        string_table.insert(key, value);
+        string_table.insert(key, unquote_inf_value(&value));
     }
+}
+
+/// Unquote an INF value, joining adjacent quoted segments.
+///
+/// INF files may concatenate quoted strings, e.g. `"Intel(R) UHD Graphics" "710"`,
+/// which Windows renders as `Intel(R) UHD Graphics710`. The whitespace between a
+/// closing and an opening quote is dropped; whitespace inside quotes is kept.
+fn unquote_inf_value(value: &str) -> String {
+    let value = value.trim();
+
+    // Fast path: a single unquoted token.
+    if !value.contains('"') {
+        return value.to_string();
+    }
+
+    let mut result = String::new();
+    let mut in_quotes = false;
+    for ch in value.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            _ => {
+                // Drop whitespace that sits between two quoted segments.
+                let between_segments = !in_quotes && ch.is_whitespace() && value.contains('"');
+                if !between_segments {
+                    result.push(ch);
+                }
+            }
+        }
+    }
+
+    // Collapse any surrounding whitespace from the last unquoted run.
+    result.trim().to_string()
 }
 
 /// Split a `key = value` line into trimmed parts. Values keep any surrounding
@@ -384,5 +415,40 @@ DeviceDesc=\"Intel(R) UHD Graphics 770\"
         let _ = fs::remove_file(&path);
         assert!(parsed.drivers.is_empty());
         assert_eq!(parsed.raw_version_info.class.as_deref(), Some("System"));
+    }
+
+    #[test]
+    fn joins_adjacent_quoted_strings() {
+        // Intel INFs write `"Intel(R) UHD Graphics" "710"`.
+        let inf = "\
+[Version]
+Class=Display
+Provider=\"Intel\"
+
+[Manufacturer]
+%Mfg%=Intel
+
+[Intel]
+%DeviceDesc% = Model1, PCI\\VEN_8086&DEV_1234
+
+[Strings]
+Mfg=\"Intel\"
+DeviceDesc=\"Intel(R) UHD Graphics\" \"710\"
+";
+        let path = write_temp("adjacent.inf", inf);
+        let parsed = parse_inf_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            parsed.drivers[0].device_name.as_deref(),
+            Some("Intel(R) UHD Graphics710")
+        );
+    }
+
+    #[test]
+    fn unquote_handles_plain_and_quoted() {
+        assert_eq!(unquote_inf_value("Intel"), "Intel");
+        assert_eq!(unquote_inf_value("\"Intel\""), "Intel");
+        assert_eq!(unquote_inf_value("\"A\" \"B\""), "AB");
     }
 }
