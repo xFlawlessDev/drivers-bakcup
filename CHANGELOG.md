@@ -2,6 +2,17 @@
 
 ## v2.4 - Driver Store Coverage
 
+### Internal Refactor
+
+- Split the single `main.rs` (≈1900 lines) into focused modules: `cli`,
+  `models`, `backup`, `driver_store`, `inf_parser`, `inf_extract`, `scan`,
+  `csv_export`, `pnputil`, `wmi_query`, and `util`. `main.rs` is now a thin
+  entry point.
+- Removed duplicated CSV-escaping, folder-name sanitizing, driver-store
+  enumeration, and `pnputil` invocation code by centralizing them.
+- Added unit tests for CSV escaping, date formatting, name sanitizing, driver
+  store parsing, and INF parsing.
+
 ### Problem
 
 The backup only enumerated `Win32_PnPSignedDriver`, which returns one entry per
