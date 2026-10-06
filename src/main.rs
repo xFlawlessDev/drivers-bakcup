@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wmi::{COMLibrary, WMIConnection};
 
 // Struct for parsed INF driver information (mirrors PnPSignedDriver structure)
@@ -76,6 +76,23 @@ struct PnPSignedDriver {
 
     #[serde(rename = "DeviceID")]
     device_id: Option<String>,
+}
+
+// A driver package installed in the Windows driver store, as reported by
+// `pnputil /enum-drivers`. Unlike PnPSignedDriver, this includes packages that
+// are not currently bound to a present device (e.g. display-audio drivers that
+// only enumerate while an HDMI/display link is active).
+#[derive(Debug, Clone)]
+struct DriverStorePackage {
+    /// Published (OEM) INF name, e.g. "oem0.inf"
+    published_name: String,
+    /// Original INF file name inside the package, e.g. "intcdaud.inf"
+    original_name: Option<String>,
+    provider_name: Option<String>,
+    class_name: Option<String>,
+    class_guid: Option<String>,
+    driver_version: Option<String>,
+    driver_date: Option<String>,
 }
 
 struct DriverBackup {
@@ -219,12 +236,17 @@ impl DriverBackup {
         let mut failed_count = 0;
         let mut driver_info = Vec::new();
 
+        // OEM INFs that are bound to a present device. Anything installed in the
+        // driver store but absent from this set is backed up separately below.
+        let mut bound_oem_infs: HashSet<String> = HashSet::new();
+
         // Group drivers by Device Class, then by INF file name
         let mut drivers_by_class_inf: HashMap<String, HashMap<String, Vec<PnPSignedDriver>>> = HashMap::new();
 
         for driver in drivers {
             if let Some(inf_name) = &driver.inf_name {
                 if let Some(oem_inf) = self.extract_oem_inf_name(inf_name) {
+                    bound_oem_infs.insert(oem_inf.clone());
                     let device_class = driver.device_class.as_deref().unwrap_or("Unknown_Class").to_string();
                     
                     drivers_by_class_inf
@@ -391,8 +413,37 @@ impl DriverBackup {
             }
         }
 
+        // Second pass: back up non-Microsoft driver packages that are installed in
+        // the driver store but not bound to any present device. These never appear
+        // in Win32_PnPSignedDriver and were previously skipped entirely.
+        let verbose = matches!(self.args.command, Some(Commands::Backup { verbose: true, .. }));
+        let store_packages = Self::get_driver_store_packages();
+        let (unbound_backed_up, unbound_failed) = self.backup_unbound_driver_store_packages(
+            &base_backup_dir,
+            &bound_oem_infs,
+            &store_packages,
+            verbose,
+        )?;
+        backed_up_count += unbound_backed_up;
+        failed_count += unbound_failed;
+
+        // Write a Device Class -> Class GUID legend for mapping backups back to
+        // Windows device classes (used by database/import tooling).
+        if matches!(self.args.command, Some(Commands::Backup { dry_run, .. }) if !dry_run) {
+            let legend = Self::build_device_class_legend(&driver_info, &store_packages);
+            let legend_path = base_backup_dir.join("device_class_legend.csv");
+            Self::write_device_class_legend(&legend, &legend_path)?;
+            println!("Device class legend written: {}", legend_path.display());
+        }
+
         println!("\nDriver export completed!");
         println!("Successfully exported: {} driver packages", backed_up_count);
+        if unbound_backed_up > 0 {
+            println!(
+                "  ({} of these were installed but not bound to a present device)",
+                unbound_backed_up
+            );
+        }
         if failed_count > 0 {
             println!("Failed to export: {} drivers", failed_count);
         }
@@ -420,9 +471,11 @@ impl DriverBackup {
 
         let non_ms_drivers = self.filter_non_microsoft_drivers(all_drivers);
 
+        // Note: an empty WMI result does not mean there is nothing to do. The
+        // driver store may still hold non-Microsoft packages that are not bound
+        // to a present device, and those are handled inside backup_drivers().
         if non_ms_drivers.is_empty() {
-            println!("No non-Microsoft drivers found to export.");
-            return Ok(());
+            println!("No present non-Microsoft devices found; checking the driver store for unbound packages...");
         }
 
         self.backup_drivers(non_ms_drivers).await?;
@@ -469,6 +522,308 @@ impl DriverBackup {
         
         println!("Found {} INF mappings", lookup.len());
         lookup
+    }
+
+    /// Enumerate every driver package installed in the Windows driver store via
+    /// `pnputil /enum-drivers`. This is a superset of `Win32_PnPSignedDriver`:
+    /// it also lists packages whose device is not currently present (for example
+    /// display-audio drivers that only enumerate while an HDMI/display link is
+    /// active), which would otherwise be silently skipped by the backup.
+    fn get_driver_store_packages() -> Vec<DriverStorePackage> {
+        let output = match Command::new("pnputil").arg("/enum-drivers").output() {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Warning: could not run 'pnputil /enum-drivers': {}", e);
+                return Vec::new();
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut packages: Vec<DriverStorePackage> = Vec::new();
+        let mut current: Option<DriverStorePackage> = None;
+
+        // Field values are prefixed with a label followed by ':'. Split only on
+        // the first ':' so values that contain ':' (e.g. class GUIDs) stay intact.
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            let (key, value) = match trimmed.split_once(':') {
+                Some((k, v)) => (k.trim().to_lowercase(), v.trim().to_string()),
+                None => continue,
+            };
+
+            match key.as_str() {
+                "published name" => {
+                    if let Some(pkg) = current.take() {
+                        packages.push(pkg);
+                    }
+                    current = Some(DriverStorePackage {
+                        published_name: value.to_lowercase(),
+                        original_name: None,
+                        provider_name: None,
+                        class_name: None,
+                        class_guid: None,
+                        driver_version: None,
+                        driver_date: None,
+                    });
+                }
+                "original name" => {
+                    if let Some(ref mut pkg) = current {
+                        pkg.original_name = Some(value);
+                    }
+                }
+                "provider name" => {
+                    if let Some(ref mut pkg) = current {
+                        pkg.provider_name = Some(value);
+                    }
+                }
+                "class name" => {
+                    if let Some(ref mut pkg) = current {
+                        pkg.class_name = Some(value);
+                    }
+                }
+                "class guid" => {
+                    if let Some(ref mut pkg) = current {
+                        pkg.class_guid = Some(value);
+                    }
+                }
+                // `pnputil` prints "Driver Version:    06/16/2025 11.2.0.15"
+                "driver version" => {
+                    if let Some(ref mut pkg) = current {
+                        let mut parts = value.split_whitespace();
+                        pkg.driver_date = parts.next().map(|s| s.to_string());
+                        pkg.driver_version = parts.next().map(|s| s.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(pkg) = current.take() {
+            packages.push(pkg);
+        }
+
+        packages
+    }
+
+    fn is_microsoft_package_name(name: &str) -> bool {
+        name.to_lowercase().contains("microsoft")
+    }
+
+    /// Build a Device Class -> Class GUID legend from the WMI devices and the
+    /// driver store packages. Intended for mapping backup folders and CSV rows
+    /// back to the Windows device class GUIDs.
+    ///
+    /// Returns `(class name, class GUID, present device count, installed package
+    /// count)` sorted by class. "Present devices" comes from WMI (bound to
+    /// hardware now); "installed packages" comes from the driver store (superset,
+    /// includes packages whose device is not currently present).
+    fn build_device_class_legend(
+        drivers: &[PnPSignedDriver],
+        store_packages: &[DriverStorePackage],
+    ) -> Vec<(String, String, usize, usize)> {
+        // Key: lowercased class name -> (display name, guid, devices, packages)
+        let mut by_class: HashMap<String, (String, String, usize, usize)> = HashMap::new();
+
+        for driver in drivers {
+            let class = match driver.device_class.as_deref() {
+                Some(c) if !c.is_empty() => c,
+                _ => continue,
+            };
+            let entry = by_class
+                .entry(class.to_lowercase())
+                .or_insert_with(|| (class.to_string(), String::new(), 0, 0));
+            if entry.1.is_empty() {
+                if let Some(ref guid) = driver.class_guid {
+                    entry.1 = guid.clone();
+                }
+            }
+            entry.2 += 1;
+        }
+
+        for pkg in store_packages {
+            let class = match pkg.class_name.as_deref() {
+                Some(c) if !c.is_empty() => c,
+                _ => continue,
+            };
+            let entry = by_class
+                .entry(class.to_lowercase())
+                .or_insert_with(|| (class.to_string(), String::new(), 0, 0));
+            if entry.1.is_empty() {
+                if let Some(ref guid) = pkg.class_guid {
+                    entry.1 = guid.clone();
+                }
+            }
+            entry.3 += 1;
+        }
+
+        let mut legend: Vec<(String, String, usize, usize)> = by_class.into_values().collect();
+        legend.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        legend
+    }
+
+    /// Write the Device Class -> Class GUID legend to a CSV file.
+    fn write_device_class_legend(
+        legend: &[(String, String, usize, usize)],
+        output_path: &Path,
+    ) -> Result<()> {
+        let escape_csv = |s: &str| -> String {
+            if s.contains(',') || s.contains('"') || s.contains('\n') {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.to_string()
+            }
+        };
+
+        let mut csv_content = String::new();
+        csv_content.push_str("Device Class,Class GUID,Present Devices,Installed Packages\n");
+        for (class, guid, device_count, package_count) in legend {
+            let guid_field = if guid.is_empty() { "Unknown" } else { guid.as_str() };
+            csv_content.push_str(&format!(
+                "{},{},{},{}\n",
+                escape_csv(class),
+                escape_csv(guid_field),
+                device_count,
+                package_count
+            ));
+        }
+
+        fs::write(output_path, csv_content)
+            .with_context(|| format!("Failed to write legend file: {}", output_path.display()))?;
+
+        Ok(())
+    }
+
+    /// Back up driver packages that are installed in the driver store but are not
+    /// bound to any present device (and therefore absent from WMI output). These
+    /// are exactly the "edge case" drivers (e.g. display audio) that would only
+    /// be caught when their hardware happens to be connected.
+    fn backup_unbound_driver_store_packages(
+        &self,
+        base_backup_dir: &Path,
+        bound_oem_infs: &HashSet<String>,
+        packages: &[DriverStorePackage],
+        verbose: bool,
+    ) -> Result<(usize, usize)> {
+        if packages.is_empty() {
+            if verbose {
+                println!("No driver store packages reported by pnputil.");
+            }
+            return Ok((0, 0));
+        }
+
+        let unbound_non_ms: Vec<&DriverStorePackage> = packages
+            .iter()
+            .filter(|pkg| !bound_oem_infs.contains(&pkg.published_name))
+            .filter(|pkg| {
+                pkg.provider_name
+                    .as_deref()
+                    .map(|p| !Self::is_microsoft_package_name(p))
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        if verbose {
+            println!(
+                "Driver store check: {} package(s) installed, {} not bound to a present device.",
+                packages.len(),
+                unbound_non_ms.len()
+            );
+        }
+
+        let mut backed_up = 0usize;
+        let mut failed = 0usize;
+
+        for pkg in unbound_non_ms {
+            let device_class = pkg.class_name.as_deref().unwrap_or("Unknown_Class");
+            let class_folder_name: String = device_class
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' })
+                .collect();
+
+            // Use the original INF name for a stable, human-readable folder name
+            // (oem numbers are reassigned between machines).
+            let original = pkg.original_name.as_deref().unwrap_or(&pkg.published_name);
+            let original_stem = original
+                .strip_suffix(".inf")
+                .or_else(|| original.strip_suffix(".INF"))
+                .unwrap_or(original);
+            let version = pkg.driver_version.as_deref().unwrap_or("Unknown_Version");
+
+            let folder_name: String = format!("{}_{} Package", original_stem, version)
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == ' ' || c == '.' || c == '-' || c == '_' || c == '(' || c == ')' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+
+            let driver_backup_dir = base_backup_dir.join(&class_folder_name).join(&folder_name);
+
+            if verbose {
+                println!(
+                    "  Found unbound package: {} ({}) [{}] provider: {}",
+                    pkg.published_name,
+                    original,
+                    device_class,
+                    pkg.provider_name.as_deref().unwrap_or("Unknown")
+                );
+                println!("    Folder: {}", driver_backup_dir.display());
+            }
+
+            if let Some(Commands::Backup { dry_run, .. }) = &self.args.command {
+                if *dry_run {
+                    backed_up += 1;
+                    continue;
+                }
+            }
+
+            fs::create_dir_all(&driver_backup_dir).with_context(|| {
+                format!("Failed to create driver directory: {}", driver_backup_dir.display())
+            })?;
+
+            let backup_dir_str = driver_backup_dir.to_string_lossy();
+            if backup_dir_str.contains("..") || backup_dir_str.contains('%') {
+                eprintln!("Skipping export due to unsafe path: {}", backup_dir_str);
+                failed += 1;
+                continue;
+            }
+
+            let status = Command::new("pnputil")
+                .arg("/export-driver")
+                .arg(&pkg.published_name)
+                .arg(&driver_backup_dir)
+                .output();
+
+            match status {
+                Ok(output) if output.status.success() => {
+                    backed_up += 1;
+                    if verbose {
+                        println!("        ✓ Successfully exported unbound: {}", pkg.published_name);
+                    }
+                }
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!("✗ Failed to export unbound {}:", pkg.published_name);
+                    if !stdout.is_empty() {
+                        eprintln!("  stdout: {}", stdout.trim());
+                    }
+                    if !stderr.is_empty() {
+                        eprintln!("  stderr: {}", stderr.trim());
+                    }
+                    failed += 1;
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to execute pnputil for {}: {}", pkg.published_name, e);
+                    failed += 1;
+                }
+            }
+        }
+
+        Ok((backed_up, failed))
     }
 
     /// Export WMI driver info to CSV, grouped by driver version (collection)
@@ -1458,9 +1813,9 @@ impl InfParser {
 // Add CLI arguments for backup functionality
 #[derive(Parser)]
 #[command(name = "driver-backup")]
-#[command(version = "2.3")]
+#[command(version = "2.4")]
 #[command(about = "A tool to backup, inspect, and manage non-Microsoft drivers")]
-#[command(long_about = "Driver Backup Tool v2.3\n\n\
+#[command(long_about = "Driver Backup Tool v2.4\n\n\
     Commands:\n  \
     backup   - Export all non-Microsoft drivers from the system (requires Admin)\n  \
     inspect  - Extract driver info from installer packages (.exe, .zip, .7z, folder)\n  \
@@ -1697,12 +2052,80 @@ fn main() -> Result<()> {
                     }
                 }
 
+                // Also export installed packages that are not bound to a present
+                // device (e.g. display-audio drivers). They never appear in WMI,
+                // so without this they would only be backed up while their
+                // hardware happens to be connected.
+                let store_packages = DriverBackup::get_driver_store_packages();
+                let unbound_packages: Vec<&DriverStorePackage> = store_packages
+                    .iter()
+                    .filter(|pkg| !exported_infs.contains(&pkg.published_name))
+                    .filter(|pkg| {
+                        all || pkg
+                            .provider_name
+                            .as_deref()
+                            .map(|p| !p.to_lowercase().contains("microsoft"))
+                            .unwrap_or(true)
+                    })
+                    .collect();
+
+                if !unbound_packages.is_empty() {
+                    println!(
+                        "Found {} installed package(s) not bound to a present device.",
+                        unbound_packages.len()
+                    );
+                }
+
+                for pkg in &unbound_packages {
+                    let device_class = pkg.class_name.as_deref().unwrap_or("Unknown");
+                    let version = pkg.driver_version.as_deref().unwrap_or("Unknown");
+                    let provider = pkg.provider_name.as_deref().unwrap_or("Unknown");
+                    let original = pkg.original_name.as_deref().unwrap_or(&pkg.published_name);
+
+                    let folder_name = format!("{}_{}_{}", device_class, provider, version)
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+                        .collect::<String>();
+
+                    let driver_dir = backup_dir.join(&folder_name);
+                    fs::create_dir_all(&driver_dir).ok();
+
+                    if verbose {
+                        println!("  Exporting unbound {} ({}) -> {}", pkg.published_name, original, folder_name);
+                    }
+
+                    let status = Command::new("pnputil")
+                        .arg("/export-driver")
+                        .arg(&pkg.published_name)
+                        .arg(&driver_dir)
+                        .output();
+
+                    match status {
+                        Ok(result) if result.status.success() => {
+                            success_count += 1;
+                        }
+                        _ => {
+                            fail_count += 1;
+                            if verbose {
+                                eprintln!("    Failed to export {}", pkg.published_name);
+                            }
+                        }
+                    }
+                }
+
                 println!("Driver files exported: {} success, {} failed", success_count, fail_count);
 
                 // Create CSV in backup directory
                 let csv_path = backup_dir.join("all_drivers.csv");
                 DriverBackup::export_wmi_drivers_csv_static(&filtered_drivers, &csv_path, verbose)?;
-                
+
+                // Device Class -> Class GUID legend for mapping/import tooling
+                let legend =
+                    DriverBackup::build_device_class_legend(&filtered_drivers, &store_packages);
+                let legend_path = backup_dir.join("device_class_legend.csv");
+                DriverBackup::write_device_class_legend(&legend, &legend_path)?;
+                println!("Device class legend written: {}", legend_path.display());
+
                 println!("\nBackup location: {}", backup_dir.display());
             } else {
                 // Just export CSV

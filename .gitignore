@@ -1,1 +1,9 @@
 /target
+
+# Build artifacts
+*.exe
+*.pdb
+
+# Default backup output
+/driver_backup
+/driver_backup/*

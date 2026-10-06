@@ -1,12 +1,37 @@
 # Driver Backup Tool
 
-A Rust-based tool to backup, inspect, and manage non-Microsoft drivers on Windows systems.
+A Rust-based tool to backup, inspect, and manage non-Microsoft drivers on
+Windows. Designed to produce database-ready output.
 
-## Features
+- **Backup** - export third-party drivers with an organized folder structure
+- **Inspect** - extract driver information from installer packages
+- **Scan** - list all INF files in a folder with a detailed summary
+- **Export** - dump connected-device inventory to CSV
 
-- **Backup**: Export third-party drivers with organized folder structure
-- **Inspect**: Extract driver information from installer packages (.exe, .zip, .7z)
-- **Scan**: Identify and list all INF files in a folder with detailed summary
+---
+
+## Requirements
+
+- **Windows 10/11** (Server 2016+ supported)
+- **Administrator rights** - required for `backup` and `export`
+- **7-Zip** (optional) - needed to extract `.exe`, `.7z`, `.rar` in `inspect`
+
+## Installation
+
+From a release:
+
+```powershell
+.\driver-backup.exe --help
+```
+
+From source:
+
+```powershell
+cargo build --release
+# binary at target\release\driver-backup.exe
+```
+
+---
 
 ## Commands Overview
 
@@ -14,42 +39,50 @@ A Rust-based tool to backup, inspect, and manage non-Microsoft drivers on Window
 driver-backup.exe <COMMAND>
 
 Commands:
-  backup   Backup drivers to specified directory
-  inspect  Inspect driver package (exe/zip/folder) to extract driver information
-  scan     Scan a folder to identify and list all INF files with summary
+  backup   Backup drivers to a specified directory
+  inspect  Inspect a driver package (exe/zip/folder) for driver information
+  scan     Scan a folder to identify and list all INF files
+  export   Export connected device hardware IDs to CSV
 ```
 
 ---
 
 ## 1. Backup Command
 
-Export all non-Microsoft drivers from the system.
-
-**Requires Administrator privileges.**
-
-### Usage
+Exports all non-Microsoft drivers. **Requires Administrator.**
 
 ```powershell
-# Basic backup (default: driver_backup folder)
+# Basic backup (default: .\driver_backup)
 .\driver-backup.exe backup
 
-# Custom output directory
-.\driver-backup.exe backup -o "D:\MyBackups"
+# Custom output directory, verbose
+.\driver-backup.exe backup -o "D:\Backups" -v
 
-# With verbose logging
-.\driver-backup.exe backup -o "D:\MyBackups" -v
-
-# Preview without actually exporting (dry run)
+# Preview without exporting
 .\driver-backup.exe backup -d -v
 ```
-
-### Options
 
 | Option | Long | Description |
 |--------|------|-------------|
 | `-o` | `--output <PATH>` | Output directory (default: `driver_backup`) |
-| `-v` | `--verbose` | Enable verbose output |
-| `-d` | `--dry-run` | Preview operations without executing |
+| `-v` | `--verbose` | Detailed per-package logging |
+| `-d` | `--dry-run` | Preview without exporting |
+
+### What gets backed up
+
+The backup covers two sources:
+
+1. **Present devices** - drivers bound to hardware that Windows reports right
+   now (queried from WMI).
+2. **Driver store packages** - every non-Microsoft package installed in the
+   driver store (`pnputil /enum-drivers`), including packages whose device is
+   *not currently connected*.
+
+The second source matters for hardware that only enumerates while attached. The
+classic example is **display audio** (`intcdaud.inf`, `mshdadac.inf`): its device
+appears only while an HDMI/DisplayPort link is active. Without the driver-store
+pass, that audio driver would be silently skipped unless a cable was connected at
+backup time.
 
 ### Output Structure
 
@@ -58,182 +91,128 @@ driver_backup/
 └── drivers_YYYYMMDD_HHMMSS/
     ├── Display/
     │   └── NVIDIA GeForce RTX 3080_30.0.15.1179 Package/
-    │       ├── driver_info.csv
     │       └── [exported driver files]
+    ├── Media/
+    │   ├── Realtek High Definition Audio_6.0.9346.1 Package/
+    │   └── intcdaud_11.2.0.15 Package/          <- unbound, name from INF
     ├── Net/
     │   └── Intel Ethernet I219-V_12.19.2.45 Package/
-    │       ├── driver_info.csv
-    │       └── [exported driver files]
     ├── all_drivers.csv
-    └── driver_backup_summary.txt
+    └── device_class_legend.csv
 ```
+
+Folders are grouped by device class, then package. Packages that are not bound
+to a present device are named from their original INF (e.g. `intcdaud`) because
+OEM numbers (`oemN.inf`) are reassigned between machines.
+
+### `all_drivers.csv`
+
+Master CSV with one row per INF package found in the backup:
+
+```csv
+INF File,Device Class,Provider,Driver Version,Driver Date,Device Count,Folder Name,Device Names,Hardware IDs
+```
+
+### `device_class_legend.csv`
+
+Maps each Windows device class to its class GUID, for building database mappings
+and correlating `all_drivers.csv` rows.
+
+```csv
+Device Class,Class GUID,Present Devices,Installed Packages
+DISPLAY,{4d36e968-e325-11ce-bfc1-08002be10318},1,1
+MEDIA,{4d36e96c-e325-11ce-bfc1-08002be10318},2,4
+NET,{4d36e972-e325-11ce-bfc1-08002be10318},3,3
+```
+
+- **Present Devices** - bound to hardware now (from WMI)
+- **Installed Packages** - present in the driver store, including packages whose
+  device is not currently connected
 
 ---
 
 ## 2. Inspect Command
 
-Extract driver information from installer packages or folders. Useful for analyzing driver packages before installation.
-
-### Usage
+Extracts driver information from an installer package or folder without
+installing anything.
 
 ```powershell
-# Inspect a folder containing INF files
+# A folder containing INF files
 .\driver-backup.exe inspect -p "C:\Downloads\DriverPackage"
 
-# Inspect an installer (.exe, .zip, .7z, .rar)
-.\driver-backup.exe inspect -p "C:\Downloads\Intel_Graphics_Driver.exe"
+# An installer archive
+.\driver-backup.exe inspect -p "C:\Downloads\Intel_Graphics.exe"
 
-# Inspect and export to CSV
-.\driver-backup.exe inspect -p "C:\Downloads\DriverPackage" -o "drivers.csv"
-
-# With verbose output
-.\driver-backup.exe inspect -p "C:\Downloads\DriverPackage" -v
+# Export findings to CSV
+.\driver-backup.exe inspect -p "C:\Downloads\DriverPackage" -o "info.csv"
 ```
-
-### Options
 
 | Option | Long | Description |
 |--------|------|-------------|
-| `-p` | `--path <PATH>` | Path to driver installer or folder (required) |
-| `-o` | `--output <CSV>` | Output CSV file path (optional) |
-| `-v` | `--verbose` | Show detailed output |
+| `-p` | `--path <PATH>` | Installer or folder (required) |
+| `-o` | `--output <CSV>` | Output CSV file (optional) |
+| `-v` | `--verbose` | Show all device entries |
 
-### Supported Formats
-
-- **Folders**: Directly scan for INF files
-- **Archives**: `.exe`, `.zip`, `.7z`, `.rar` (requires 7-Zip for non-zip formats)
-- **Single INF**: Direct INF file path
-
-### Output Example
-
-```
-========================================
-       Driver Package Inspection
-========================================
-
-Found 3 INF files with 45 device entries
-
-----------------------------------------
-INF File: igdlh64.inf
-Path: C:\Downloads\Intel\Graphics\igdlh64.inf
-Device Class: Display
-Class GUID: {4d36e968-e325-11ce-bfc1-08002be10318}
-Driver Version: 31.0.101.5590
-Driver Date: 12/01/2024
-Provider: Intel Corporation
-
-Supported Devices (15):
-  1. Intel(R) UHD Graphics 630
-     Hardware ID: PCI\VEN_8086&DEV_3E92
-  2. Intel(R) UHD Graphics 620
-     Hardware ID: PCI\VEN_8086&DEV_5917
-  ...
-```
+Supported inputs: folders, `.exe`, `.zip`, `.7z`, `.rar`, and single `.inf`
+files.
 
 ---
 
 ## 3. Scan Command
 
-Scan a folder to identify and list all INF files with summary information.
-
-### Usage
+Lists all INF files in a folder with a summary.
 
 ```powershell
-# Scan current folder only
+# Current folder only
 .\driver-backup.exe scan -p "C:\Drivers"
 
-# Scan including all subfolders (recursive)
-.\driver-backup.exe scan -p "C:\Drivers" -r
-
-# Group results by device class
-.\driver-backup.exe scan -p "C:\Drivers" -g
-
-# Export results to CSV
-.\driver-backup.exe scan -p "C:\Drivers" -o "scan_results.csv"
-
-# Full options: recursive, verbose, grouped, with CSV export
-.\driver-backup.exe scan -p "C:\Drivers" -r -v -g -o "scan_results.csv"
+# Recursive, grouped by class, export to CSV
+.\driver-backup.exe scan -p "C:\Drivers" -r -g -o "inventory.csv"
 ```
-
-### Options
 
 | Option | Long | Description |
 |--------|------|-------------|
-| `-p` | `--path <PATH>` | Path to folder (required) |
-| `-o` | `--output <CSV>` | Output CSV file path (optional) |
-| `-v` | `--verbose` | Show detailed info including all Hardware IDs |
+| `-p` | `--path <PATH>` | Folder to scan (required) |
+| `-o` | `--output <CSV>` | Output CSV file (optional) |
+| `-v` | `--verbose` | Show all Hardware IDs |
 | `-g` | `--group` | Group results by device class |
-| `-r` | `--recursive` | Scan subfolders recursively |
+| `-r` | `--recursive` | Include subfolders |
 
-### Output Example (List Mode)
+---
 
-```
-========================================
-         INF Folder Scan Results
-========================================
+## 4. Export Command
 
-Folder: C:\Drivers
-Total INF files found: 5
-Successfully parsed: 5
-Total device entries: 128
+Inventory of connected devices. Without `-f` it writes a CSV only; with `-f` it
+also exports driver files (same behavior as `backup`).
 
-----------------------------------------
-INF Files Summary:
-----------------------------------------
+```powershell
+# CSV inventory of connected devices
+.\driver-backup.exe export -o "hardware_inventory.csv"
 
-1. igdlh64.inf
-   Class: Display
-   Version: 31.0.101.5590
-   Date: 12/01/2024
-   Provider: Intel Corporation
-   Devices: 45 entries
+# Include Microsoft drivers
+.\driver-backup.exe export -o "inventory.csv" --all
 
-2. e1d65x64.inf
-   Class: Net
-   Version: 12.19.2.45
-   Date: 10/15/2024
-   Provider: Intel Corporation
-   Devices: 12 entries
+# Also export driver files + legend
+.\driver-backup.exe export -o "D:\Inventory" -f
 ```
 
-### Output Example (Grouped Mode with `-g`)
-
-```
-----------------------------------------
-INF Files by Device Class:
-----------------------------------------
-
-[Display] (2 INF files)
-  - igdlh64.inf (v31.0.101.5590, 45 devices)
-  - nvdmi.inf (v546.33, 38 devices)
-
-[Net] (2 INF files)
-  - e1d65x64.inf (v12.19.2.45, 12 devices)
-  - rt640x64.inf (v10.050.1021.2021, 8 devices)
-
-[Media] (1 INF files)
-  - hdxrt.inf (v6.0.9346.1, 25 devices)
-```
-
-### CSV Export Format
-
-```csv
-INF File,Device Class,Provider,Driver Version,Driver Date,Device Count,Device Names,Hardware IDs
-igdlh64.inf,Display,Intel Corporation,31.0.101.5590,12/01/2024,45,"Intel UHD 630; Intel UHD 620","PCI\VEN_8086&DEV_3E92; PCI\VEN_8086&DEV_5917"
-```
+| Option | Long | Description |
+|--------|------|-------------|
+| `-o` | `--output <PATH>` | CSV path or output directory |
+| `--all` | `--all` | Include Microsoft drivers |
+| `-v` | `--verbose` | Detailed output |
+| `-f` | `--files` | Also export driver files |
 
 ---
 
 ## Driver Information Captured
 
-All commands capture the following information from INF files:
-
 | Field | Description |
 |-------|-------------|
 | Device Name | Friendly name of the device |
-| Driver Version | Version number (e.g., 31.0.101.5590) |
+| Driver Version | Version number (e.g. `31.0.101.5590`) |
 | Driver Date | Release date |
-| Hardware ID | PCI\VEN_xxxx&DEV_xxxx format |
+| Hardware ID | `PCI\VEN_xxxx&DEV_xxxx` format |
 | Device Class | Display, Net, Media, etc. |
 | Class GUID | Windows device class GUID |
 | Provider | Driver publisher (Intel, NVIDIA, etc.) |
@@ -242,49 +221,38 @@ All commands capture the following information from INF files:
 
 ---
 
-## Requirements
+## Database Workflow
 
-- **Windows 10/11** (Server 2016+ supported)
-- **Administrator Rights** - Required for `backup` command
-- **7-Zip** (optional) - For extracting `.exe`, `.7z`, `.rar` in `inspect` command
+Individual driver packages can be uploaded one at a time, or the whole backup
+can be imported in bulk.
 
-## Installation
+1. Run `backup` and review `all_drivers.csv` plus `device_class_legend.csv`.
+2. Import `all_drivers.csv` into your database (bulk), using the `Folder Name`
+   column to locate each package.
+3. Zip each package folder and upload to file storage.
+4. Store the zip path in the database record.
 
-### From Release
-Download the latest release and run `driver-backup.exe`.
+Example schema:
 
-### Build from Source
-```powershell
-# Clone and build
-git clone <repository>
-cd driver-backup
-cargo build --release
+```sql
+CREATE TABLE drivers (
+    id            INTEGER PRIMARY KEY,
+    device_name   VARCHAR(255),
+    driver_version VARCHAR(50),
+    driver_date   DATE,
+    hardware_id   VARCHAR(255),
+    inf_name      VARCHAR(100),
+    provider      VARCHAR(100),
+    device_class  VARCHAR(50),
+    class_guid    VARCHAR(50),
+    backup_folder VARCHAR(255),
+    zip_file_path VARCHAR(500),
+    backup_date   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
-# Binary located at target/release/driver-backup.exe
-```
-
----
-
-## Examples
-
-### Backup all third-party drivers
-```powershell
-.\driver-backup.exe backup -o "D:\DriverBackup" -v
-```
-
-### Analyze a downloaded driver package
-```powershell
-.\driver-backup.exe inspect -p "C:\Downloads\NVIDIA_Driver_546.33.exe" -o "nvidia_info.csv"
-```
-
-### Find all drivers in a folder tree
-```powershell
-.\driver-backup.exe scan -p "D:\DriverRepository" -r -g -o "inventory.csv"
-```
-
-### Preview backup without exporting
-```powershell
-.\driver-backup.exe backup -d -v
+CREATE INDEX idx_device_name ON drivers(device_name);
+CREATE INDEX idx_provider    ON drivers(provider);
+CREATE INDEX idx_driver_date ON drivers(driver_date);
 ```
 
 ---
@@ -293,23 +261,17 @@ cargo build --release
 
 | Issue | Solution |
 |-------|----------|
-| "Admin privileges required" | Run as Administrator (backup command) |
-| "Failed to export driver" | Driver may be protected; check verbose output |
-| "7-Zip not found" | Install 7-Zip or use .zip format for inspect |
-| "No INF files found" | Check path; use `-r` for recursive scan |
-| "Path too long" | Use shorter output path |
+| "requires administrative privileges" | Run as Administrator |
+| "Failed to export driver" | Driver may be protected or in use; check `-v` output |
+| "7-Zip not found" | Install 7-Zip, or use `.zip` for `inspect` |
+| "No INF files found" | Check the path; add `-r` for recursive scan |
+| "Path too long" | Use a shorter output path, e.g. `C:\Backup` |
+| A driver is missing from the backup | Confirm it is installed in the driver store with `pnputil /enum-drivers`. Microsoft inbox INFs (e.g. `hdaudio.inf`) ship with Windows and are intentionally excluded. |
 
 ---
 
-## Version History
+## Version
 
-- **v2.3** - Added `scan` and `inspect` commands with recursive support
-- **v2.2** - Database-ready CSV export, improved folder structure
-- **v2.1** - INF-based grouping, device class organization
-- **v2.0** - Initial release with backup functionality
+See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
----
-
-**Version**: 2.3  
-**Last Updated**: 2025-12-09  
-**Compatible**: Windows 10/11, Server 2016+
+Current: **v2.4**
