@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.5.4 - Pack Zipping and Driver Date
+
+### Added
+
+- `pack --zip` (`-z`) creates a `<folder>.zip` archive per package and removes
+  the folder, so the pack contains only archives plus the manifests and is ready
+  to upload as-is. `--keep-folders` retains the folders after archiving.
+  Zip creation uses `Compress-Archive` with a `System.IO.Compression.ZipFile`
+  fallback.
+- `Driver Date` column in `manifest.csv`, normalized to `YYYY-MM-DD`.
+- `Archive` column in `manifest.csv`, listing the zip file name when `--zip` is
+  used.
+
 ## v2.5.3 - Manifest Consistency
 
 ### Fixed

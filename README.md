@@ -220,6 +220,12 @@ predictable format for upload.
 # Override the detected metadata
 .\driver-backup.exe pack -p "D:\Drivers" -o "D:\Normalized" --odm Clevo --model 765 --revision V2xxRNP_1.08.06_0911
 
+# Zip each package (folders removed) for direct upload
+.\driver-backup.exe pack -p "D:\Drivers" -o "D:\Normalized" --zip
+
+# Zip but keep the folders too
+.\driver-backup.exe pack -p "D:\Drivers" -o "D:\Normalized" --zip --keep-folders
+
 # Preview the planned layout without writing anything
 .\driver-backup.exe pack -p "D:\Drivers" -o "D:\Normalized" --dry-run
 
@@ -236,6 +242,8 @@ predictable format for upload.
 | | `--revision <REV>` | Override the pack revision |
 | | `--keep-duplicates` | Keep duplicate packages instead of collapsing them |
 | | `--manifest-only` | Write only the manifest; do not copy files |
+| `-z` | `--zip` | Zip each package folder for upload |
+| | `--keep-folders` | With `--zip`, keep the folders after archiving |
 | `-d` | `--dry-run` | Preview the planned layout |
 | `-v` | `--verbose` | Per-package output |
 
@@ -262,6 +270,8 @@ predictable format for upload.
 
 ### Output Structure
 
+Without `--zip`, each package is a folder:
+
 ```
 driver_pack/
 └── Clevo_765_V2xxRNP_1.08.06_0911/
@@ -271,6 +281,19 @@ driver_pack/
     ├── MEDIA_Intel(R) Corporation_10.29.00.10981_intcbtau/
     ├── Net_Realtek_10.074.1128.2024_rt640x64/
     └── 10_SBX/                    <- installer-only, no INF
+```
+
+With `--zip`, each package becomes `<folder>.zip` (folder removed unless
+`--keep-folders`), so the pack is ready to upload as-is:
+
+```
+driver_pack/
+└── Clevo_765_V2xxRNP_1.08.06_0911/
+    ├── manifest.csv
+    ├── summary.csv
+    ├── Display_Intel Corporation_32.0.101.6556_iigd_dch.zip
+    ├── MEDIA_Intel(R) Corporation_10.29.00.10981_intcbtau.zip
+    └── 10_SBX.zip
 ```
 
 ### `manifest.csv`
@@ -285,6 +308,7 @@ One row per **merged** driver package.
 | `Device Class` | INF device class, canonicalized |
 | `Driver Name` | INF file name without extension |
 | `Driver Version` | Version from the INF |
+| `Driver Date` | Driver date from the INF, normalized to `YYYY-MM-DD` |
 | `Provider` | Driver publisher (references resolved) |
 | `Device Count` | Number of device entries across merged packages |
 | `Device Name Count` | Number of unique friendly device names |
@@ -294,6 +318,7 @@ One row per **merged** driver package.
 | `Normalized Folder` | Destination folder name |
 | `Source Folder` | Representative source path (the copied package) |
 | `Merged From` | Other source folders collapsed into this entry |
+| `Archive` | Zip file name (with `--zip`), otherwise empty |
 | `File Count` / `Total Bytes` | Size of the representative package |
 | `INF SHA256` | Content hash of the representative INF |
 | `Duplicate Of` | Set when another member had identical INF content |

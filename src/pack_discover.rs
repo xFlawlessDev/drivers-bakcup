@@ -88,6 +88,7 @@ pub fn discover_drivers(source: &Path, verbose: bool) -> Result<Vec<PackDriver>>
             inf_name,
             device_class,
             driver_version: parsed.raw_version_info.driver_version.clone(),
+            driver_date: parsed.raw_version_info.driver_date.clone(),
             provider,
             device_count: parsed.drivers.len(),
             device_names,
@@ -459,6 +460,57 @@ pub fn clean_version(version: Option<&str>) -> String {
     }
 }
 
+/// Normalize an INF `DriverVer` date to ISO `YYYY-MM-DD` when possible.
+///
+/// INF dates are usually `MM/DD/YYYY`. Returns `Unknown` when absent and the
+/// original value when it cannot be parsed.
+pub fn clean_driver_date(date: Option<&str>) -> String {
+    let raw = date.unwrap_or("").trim();
+    if raw.is_empty() {
+        return "Unknown".to_string();
+    }
+
+    // Take the date portion before any `;` comment or trailing time.
+    let token = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    if let Some((y, m, d)) = parse_inf_date(token) {
+        return format!("{:04}-{:02}-{:02}", y, m, d);
+    }
+
+    token.to_string()
+}
+
+/// Parse `MM/DD/YYYY` or `YYYY/MM/DD` into `(year, month, day)`.
+fn parse_inf_date(token: &str) -> Option<(u32, u32, u32)> {
+    let parts: Vec<&str> = token.split('/').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let a: u32 = parts[0].parse().ok()?;
+    let b: u32 = parts[1].parse().ok()?;
+    let c: u32 = parts[2].parse().ok()?;
+
+    // A 4-digit first component means YYYY/MM/DD.
+    let (year, month, day) = if parts[0].len() == 4 {
+        (a, b, c)
+    } else {
+        (c, a, b)
+    };
+
+    if (1..=12).contains(&month) && (1..=31).contains(&day) && year >= 1900 {
+        Some((year, month, day))
+    } else {
+        None
+    }
+}
+
 /// True for INF classes that vendors leave as unresolved placeholders.
 pub fn is_placeholder_class(class: &str) -> bool {
     let lower = class.to_lowercase();
@@ -526,6 +578,7 @@ mod tests {
             inf_name: inf.to_string(),
             device_class: Some(class.to_string()),
             driver_version: Some(version.to_string()),
+            driver_date: Some("01/15/2025".to_string()),
             provider: Some("Intel".to_string()),
             device_count: 1,
             device_names: vec!["Intel(R) UHD Graphics".to_string()],
@@ -762,5 +815,20 @@ mod tests {
             "1.0.0.16"
         );
         assert_eq!(clean_version(None), "NoVersion");
+    }
+
+    #[test]
+    fn driver_date_is_normalised_to_iso() {
+        assert_eq!(clean_driver_date(Some("06/17/2026")), "2026-06-17");
+        assert_eq!(clean_driver_date(Some("2026/06/17")), "2026-06-17");
+        assert_eq!(clean_driver_date(Some("11/2/2025")), "2025-11-02");
+        assert_eq!(clean_driver_date(Some("06/17/2026; comment")), "2026-06-17");
+        assert_eq!(clean_driver_date(None), "Unknown");
+    }
+
+    #[test]
+    fn driver_date_invalid_is_returned_as_is() {
+        assert_eq!(clean_driver_date(Some("not-a-date")), "not-a-date");
+        assert_eq!(clean_driver_date(Some("13/45/2026")), "13/45/2026");
     }
 }

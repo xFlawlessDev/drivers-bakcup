@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "driver-backup")]
-#[command(version = "2.5.3")]
+#[command(version = "2.5.4")]
 #[command(about = "A tool to backup, inspect, and manage non-Microsoft drivers")]
-#[command(long_about = "Driver Backup Tool v2.5.3\n\n\
+#[command(long_about = "Driver Backup Tool v2.5.4\n\n\
     Commands:\n  \
     backup   - Export all non-Microsoft drivers from the system (requires Admin)\n  \
     inspect  - Extract driver info from installer packages (.exe, .zip, .7z, folder)\n  \
@@ -123,6 +123,14 @@ pub enum Commands {
         /// Only write the manifest; do not copy driver files
         #[arg(long)]
         manifest_only: bool,
+
+        /// Zip each driver package folder after copying
+        #[arg(short = 'z', long)]
+        zip: bool,
+
+        /// Keep the package folders after zipping (default: remove them)
+        #[arg(long)]
+        keep_folders: bool,
 
         /// Preview the planned layout without writing anything
         #[arg(short, long)]

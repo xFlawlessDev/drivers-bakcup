@@ -21,8 +21,9 @@ use crate::csv_export::{
 };
 use crate::models::{PackDriver, PackMetadata};
 use crate::pack_discover::{
-    clean_version, count_tree, discover_drivers, discover_installer_only_categories,
-    format_device_names, format_hardware_ids, manifest_class_name, normalized_folder_name,
+    clean_driver_date, clean_version, count_tree, discover_drivers,
+    discover_installer_only_categories, format_device_names, format_hardware_ids,
+    manifest_class_name, normalized_folder_name,
 };
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -36,6 +37,10 @@ pub struct PackOptions {
     pub metadata: PackMetadata,
     pub dedup: bool,
     pub copy_files: bool,
+    /// Zip each package folder after copying.
+    pub zip: bool,
+    /// Keep the source folder after zipping (only meaningful with `zip`).
+    pub keep_folders: bool,
     pub verbose: bool,
     pub dry_run: bool,
 }
@@ -99,6 +104,12 @@ pub fn run_pack(opts: &PackOptions) -> Result<PackResult> {
 
     if opts.copy_files {
         materialize(&rows, &drivers, &pack_root, opts.verbose)?;
+    }
+
+    // Optionally zip each package folder, then drop the folder unless asked to
+    // keep it. The manifest is written before zipping so it can record archives.
+    if opts.zip && opts.copy_files {
+        zip_packages(&mut rows, &pack_root, opts)?;
     }
 
     fs::create_dir_all(&pack_root)
@@ -239,6 +250,7 @@ fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
             device_class: manifest_class_name(driver.device_class.as_deref()),
             driver_name: crate::util::strip_inf_extension(&driver.inf_name).to_string(),
             driver_version: clean_version(driver.driver_version.as_deref()),
+            driver_date: clean_driver_date(driver.driver_date.as_deref()),
             provider: driver
                 .provider
                 .clone()
@@ -251,6 +263,7 @@ fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
             normalized_folder: folder,
             source_folder: source_rel,
             merged_from: merged_from.join("; "),
+            archive: String::new(),
             file_count: driver.files.len(),
             total_bytes: driver.total_bytes,
             inf_hash: driver.inf_hash.clone(),
@@ -285,6 +298,7 @@ fn append_installer_only_rows(
             device_class: "Installer".to_string(),
             driver_name: name.clone(),
             driver_version: "None".to_string(),
+            driver_date: "None".to_string(),
             provider: String::new(),
             device_count: 0,
             device_names: String::new(),
@@ -294,6 +308,7 @@ fn append_installer_only_rows(
             normalized_folder: name.clone(),
             source_folder: relative_path_str(dir),
             merged_from: String::new(),
+            archive: String::new(),
             file_count,
             total_bytes,
             inf_hash: String::new(),
@@ -402,6 +417,51 @@ fn copy_tree(src: &Path, dest: &Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+/// Zip each package folder into `<folder>.zip` and record the archive name.
+///
+/// Unless `keep_folders` is set, the folder is removed afterwards so the pack
+/// contains only archives plus the manifests -- ready to upload as-is.
+fn zip_packages(rows: &mut [ManifestRow], pack_root: &Path, opts: &PackOptions) -> Result<()> {
+    let mut zipped = 0usize;
+    let mut failed = 0usize;
+
+    // Installer-only categories are zipped as a whole category.
+    for row in rows.iter_mut() {
+        let folder_name = if row.status == "installer-only" {
+            row.category.clone()
+        } else {
+            row.normalized_folder.clone()
+        };
+
+        let folder_path = pack_root.join(&folder_name);
+        if !folder_path.is_dir() {
+            continue;
+        }
+
+        let archive_name = format!("{}.zip", folder_name);
+        let archive_path = pack_root.join(&archive_name);
+
+        match crate::zip::zip_directory(&folder_path, &archive_path, opts.verbose) {
+            Ok(()) => {
+                row.archive = archive_name;
+                zipped += 1;
+                if !opts.keep_folders {
+                    if let Err(e) = fs::remove_dir_all(&folder_path) {
+                        eprintln!("Warning: could not remove {}: {}", folder_path.display(), e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("✗ Failed to zip {}: {}", folder_name, e);
+                failed += 1;
+            }
+        }
+    }
+
+    println!("\nArchives created: {} ({} failed)", zipped, failed);
+    Ok(())
+}
+
 fn print_preview(rows: &[ManifestRow]) {
     println!("\nPlanned layout (first 25):");
     for row in rows.iter().take(25) {
@@ -438,6 +498,7 @@ mod tests {
             inf_name: inf.to_string(),
             device_class: Some(class.to_string()),
             driver_version: Some(version.to_string()),
+            driver_date: Some("01/15/2025".to_string()),
             provider: Some("Intel".to_string()),
             device_count: 1,
             device_names: vec!["Intel(R) UHD Graphics".to_string()],
@@ -460,6 +521,8 @@ mod tests {
             },
             dedup: true,
             copy_files: false,
+            zip: false,
+            keep_folders: false,
             verbose: false,
             dry_run: true,
         }

@@ -134,6 +134,8 @@ pub struct PackDriver {
     pub device_class: Option<String>,
     /// Driver version from the INF `[Version]` section.
     pub driver_version: Option<String>,
+    /// Driver date from the INF `[Version]` section.
+    pub driver_date: Option<String>,
     /// Provider from the INF `[Version]` section.
     pub provider: Option<String>,
     /// Number of device entries the INF declares.

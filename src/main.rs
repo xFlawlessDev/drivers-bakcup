@@ -14,6 +14,7 @@ mod pnputil;
 mod scan;
 mod util;
 mod wmi_query;
+mod zip;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -104,6 +105,8 @@ fn run(command: Commands) -> Result<()> {
             revision,
             keep_duplicates,
             manifest_only,
+            zip,
+            keep_folders,
             dry_run,
             verbose,
         } => {
@@ -115,6 +118,8 @@ fn run(command: Commands) -> Result<()> {
                 revision,
                 keep_duplicates,
                 manifest_only,
+                zip,
+                keep_folders,
                 dry_run,
                 verbose,
             )?;
@@ -133,6 +138,8 @@ fn run_pack(
     revision: Option<String>,
     keep_duplicates: bool,
     manifest_only: bool,
+    zip: bool,
+    keep_folders: bool,
     dry_run: bool,
     verbose: bool,
 ) -> Result<()> {
@@ -154,6 +161,8 @@ fn run_pack(
         metadata,
         dedup: !keep_duplicates,
         copy_files: !manifest_only,
+        zip,
+        keep_folders,
         verbose,
         dry_run,
     };
