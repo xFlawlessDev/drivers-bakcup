@@ -242,19 +242,20 @@ predictable format for upload.
 ### What it does
 
 1. **Discovers** every driver package (INF) under the source, recursively.
-2. **Groups** each package by category:
-   - If the source already uses category folders (e.g. `01_Chipset`), that
-     top-level folder is the category.
-   - If the source is flat (one folder per OEM INF, as some ODMs ship), the
-     device class is used instead.
-3. **Normalizes** the device class casing (`net`/`NET` -> `Net`) and the driver
-   version (strips `stampinf` placeholders).
-4. **Deduplicates** packages by the SHA-256 of their INF. Byte-identical copies
-   (common across per-OS sub-folders such as `W2K12R2-x64` and
-   `Windows10-x64`) collapse into a single entry.
-5. **Copies** each unique package into `Drivers/<Category>/<Class>_<Name>_<Version>/`,
-   preserving package sub-folders (`Config/`, `DLLs/`, `ifwi/`, ...) but not
-   sibling packages.
+2. **Groups** packages that describe the same driver. Packages are merged by
+   **device class + device name + driver version**, matching how `export`
+   collapses a single driver that a vendor ships as many OEM packages. For
+   example nine `ibtusb` folders (`oem37`..`oem45`) become one entry with the
+   union of their hardware IDs.
+3. **Normalizes** the device class casing (`net`/`NET` -> `Net`), resolves the
+   provider reference (`%ManufacturerName%` -> `Intel`), and cleans `stampinf`
+   version placeholders.
+4. **Detects duplicates** by INF SHA-256 within a merged group and records them
+   in `Duplicate Of`.
+5. **Copies** each unique package to a flat folder named
+   `<Class>_<Provider>_<Version>_<InfName>` directly under the pack root,
+   preserving package sub-folders (`Config/`, `ifwi/`, ...) but not sibling
+   packages. A numeric suffix is appended when two packages would collide.
 6. **Keeps** categories that have no INF (EXE/INI-only installers) as
    `installer-only` entries so nothing is lost.
 7. **Writes** `manifest.csv` and `summary.csv`.
@@ -266,19 +267,15 @@ driver_pack/
 └── Clevo_765_V2xxRNP_1.08.06_0911/
     ├── manifest.csv
     ├── summary.csv
-    └── Drivers/
-        ├── Display/
-        │   └── Display_nvcvegpu_32.0.15.7705/
-        ├── MEDIA/
-        │   └── MEDIA_IntcDAud_11.2.0.13/
-        ├── Net/
-        │   └── Net_rt640x64_10.072.0524.2024/
-        └── 10_SBX/                    <- installer-only, no INF
+    ├── Display_Intel Corporation_32.0.101.6556_iigd_dch/
+    ├── MEDIA_Intel(R) Corporation_10.29.00.10981_intcbtau/
+    ├── Net_Realtek_10.074.1128.2024_rt640x64/
+    └── 10_SBX/                    <- installer-only, no INF
 ```
 
 ### `manifest.csv`
 
-One row per discovered package.
+One row per **merged** driver package.
 
 | Column | Description |
 |--------|-------------|
@@ -288,16 +285,19 @@ One row per discovered package.
 | `Device Class` | INF device class, canonicalized |
 | `Driver Name` | INF file name without extension |
 | `Driver Version` | Version from the INF |
-| `Provider` | Driver publisher |
-| `Device Count` | Number of device entries the INF declares |
+| `Provider` | Driver publisher (references resolved) |
+| `Device Count` | Number of device entries across merged packages |
 | `Device Name Count` | Number of unique friendly device names |
 | `Device Names` | Up to 10 unique device names, then `+N more` |
-| `Normalized Folder` | Destination path within the pack |
-| `Source Folder` | Original path in the source pack |
-| `File Count` / `Total Bytes` | Package size |
-| `INF SHA256` | Content hash used for dedup |
-| `Duplicate Of` | Normalized folder of the original, if a duplicate |
-| `Status` | `unique`, `duplicate`, or `installer-only` |
+| `Hardware ID Count` | Number of unique hardware IDs |
+| `Hardware IDs` | Up to 10 unique hardware IDs, then `+N more` |
+| `Normalized Folder` | Destination folder name |
+| `Source Folder` | Representative source path (the copied package) |
+| `Merged From` | Other source folders collapsed into this entry |
+| `File Count` / `Total Bytes` | Size of the representative package |
+| `INF SHA256` | Content hash of the representative INF |
+| `Duplicate Of` | Set when another member had identical INF content |
+| `Status` | `unique`, `merged`, `duplicate`, or `installer-only` |
 
 ### `summary.csv`
 

@@ -140,6 +140,8 @@ pub struct PackDriver {
     pub device_count: usize,
     /// Unique friendly device names the INF supports, sorted.
     pub device_names: Vec<String>,
+    /// Unique hardware IDs the INF supports, sorted.
+    pub hardware_ids: Vec<String>,
     /// Top-level pack category the driver was found under, e.g. `01_Chipset`.
     pub category: Option<String>,
     /// SHA-256 of the INF file contents, used for duplicate detection.
@@ -148,4 +150,33 @@ pub struct PackDriver {
     pub files: Vec<PathBuf>,
     /// Total size in bytes of all package files.
     pub total_bytes: u64,
+}
+
+impl PackDriver {
+    /// Identity used to merge packages that describe the same driver.
+    ///
+    /// Different OEM packages can ship the same driver with slightly different
+    /// INFs (and therefore different file hashes). They should still collapse to
+    /// one entry, matching how the `export` command groups by device class + name
+    /// + version.
+    pub fn merge_key(&self) -> String {
+        let class = self
+            .device_class
+            .as_deref()
+            .unwrap_or("Unknown")
+            .trim()
+            .to_lowercase();
+        let name = self
+            .device_names
+            .first()
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_default();
+        let version = self
+            .driver_version
+            .as_deref()
+            .unwrap_or("Unknown")
+            .trim()
+            .to_lowercase();
+        format!("{}|{}|{}", class, name, version)
+    }
 }

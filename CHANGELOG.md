@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.5.2 - Pack Merging, Flat Layout, Hardware IDs
+
+### Changed
+
+- `pack` now **merges** packages that describe the same driver, keyed by device
+  class + device name + driver version. This matches the `export` command's
+  behavior: nine `ibtusb` OEM folders (`oem37`..`oem45`) collapse into one
+  entry with the union of their hardware IDs, instead of nine separate rows.
+  The other source folders are recorded in a new `Merged From` column.
+- Output is now a **flat** layout, `<pack_slug>/<Class>_<Provider>_<Version>_<InfName>/`,
+  matching `export` (no more `Drivers/<Category>/` nesting). A numeric suffix is
+  added when two packages would otherwise resolve to the same folder name.
+- Provider references (`%ManufacturerName%`, `%PROVIDER_NAME%`) are now resolved
+  against the INF `[Strings]` table in the parser, so folder names and the
+  manifest show `Intel` rather than a placeholder.
+
+### Added
+
+- `Hardware ID Count` and `Hardware IDs` columns in `manifest.csv`, listing the
+  union of unique hardware IDs across merged packages (capped at 10 with
+  `+N more`).
+
 ## v2.5.1 - Device Names in Pack Manifest
 
 ### Added

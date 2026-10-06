@@ -314,10 +314,13 @@ pub struct ManifestRow {
     pub driver_version: String,
     pub provider: String,
     pub device_count: usize,
-    pub device_names: String,
     pub device_name_count: usize,
+    pub device_names: String,
+    pub hardware_id_count: usize,
+    pub hardware_ids: String,
     pub normalized_folder: String,
     pub source_folder: String,
+    pub merged_from: String,
     pub file_count: usize,
     pub total_bytes: u64,
     pub inf_hash: String,
@@ -328,12 +331,12 @@ pub struct ManifestRow {
 /// Write the normalized driver pack manifest CSV.
 pub fn write_pack_manifest(rows: &[ManifestRow], output_path: &Path) -> Result<()> {
     let mut csv_content = String::from(
-        "Pack,ODM,Model,Revision,Category,Device Class,Driver Name,Driver Version,Provider,Device Count,Device Name Count,Device Names,Normalized Folder,Source Folder,File Count,Total Bytes,INF SHA256,Duplicate Of,Status\n",
+        "Pack,ODM,Model,Revision,Category,Device Class,Driver Name,Driver Version,Provider,Device Count,Device Name Count,Device Names,Hardware ID Count,Hardware IDs,Normalized Folder,Source Folder,Merged From,File Count,Total Bytes,INF SHA256,Duplicate Of,Status\n",
     );
 
     for row in rows {
         csv_content.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             escape_csv(&row.pack),
             escape_csv(&row.odm),
             escape_csv(&row.model),
@@ -346,8 +349,11 @@ pub fn write_pack_manifest(rows: &[ManifestRow], output_path: &Path) -> Result<(
             row.device_count,
             row.device_name_count,
             escape_csv(&row.device_names),
+            row.hardware_id_count,
+            escape_csv(&row.hardware_ids),
             escape_csv(&row.normalized_folder),
             escape_csv(&row.source_folder),
+            escape_csv(&row.merged_from),
             row.file_count,
             row.total_bytes,
             escape_csv(&row.inf_hash),

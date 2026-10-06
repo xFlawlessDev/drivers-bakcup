@@ -58,6 +58,10 @@ pub fn discover_drivers(source: &Path, verbose: bool) -> Result<Vec<PackDriver>>
         let device_class = parsed.raw_version_info.class.clone();
         let category = resolve_category(source, &source_dir, device_class.as_deref());
 
+        // The `[Version]` provider is often a `%StringKey%` reference; resolve it
+        // so folder names and the manifest show a real provider name.
+        let provider = resolve_provider(&parsed);
+
         // Unique, sorted friendly device names for the manifest.
         let mut device_names: Vec<String> = parsed
             .drivers
@@ -68,15 +72,26 @@ pub fn discover_drivers(source: &Path, verbose: bool) -> Result<Vec<PackDriver>>
         device_names.sort();
         device_names.dedup();
 
+        // Unique, sorted hardware IDs for the manifest.
+        let mut hardware_ids: Vec<String> = parsed
+            .drivers
+            .iter()
+            .filter_map(|d| d.hardware_id.clone())
+            .filter(|h| !h.trim().is_empty())
+            .collect();
+        hardware_ids.sort();
+        hardware_ids.dedup();
+
         drivers.push(PackDriver {
             category: Some(category),
             source_dir,
             inf_name,
             device_class,
             driver_version: parsed.raw_version_info.driver_version.clone(),
-            provider: parsed.raw_version_info.provider.clone(),
+            provider,
             device_count: parsed.drivers.len(),
             device_names,
+            hardware_ids,
             inf_hash,
             files,
             total_bytes,
@@ -114,7 +129,67 @@ fn find_inf_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Determine the category folder for a driver.
+/// Resolve the provider name from an INF.
+///
+/// The parser resolves `[Version] Provider` references against `[Strings]`, so
+/// this normally just returns that value. A `%Key%` fallback is kept for INFs
+/// whose string table is missing.
+fn resolve_provider(parsed: &crate::models::ParsedInfFile) -> Option<String> {
+    let raw = parsed.raw_version_info.provider.as_deref()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw.starts_with('%') && raw.ends_with('%') && raw.len() > 2 {
+        // Unresolved reference: fall back to a device's provider, then the
+        // manufacturer, then a humanised key name.
+        if let Some(resolved) = parsed
+            .drivers
+            .iter()
+            .filter_map(|d| d.driver_provider_name.as_deref())
+            .find(|p| !p.trim().is_empty() && !(p.starts_with('%') && p.ends_with('%')))
+        {
+            return Some(resolved.to_string());
+        }
+        if let Some(mfg) = parsed
+            .drivers
+            .iter()
+            .filter_map(|d| d.manufacturer.as_deref())
+            .find(|m| !m.trim().is_empty())
+        {
+            return Some(mfg.to_string());
+        }
+        let key = &raw[1..raw.len() - 1];
+        return Some(clean_provider_key(key));
+    }
+
+    Some(raw.to_string())
+}
+
+/// Turn a provider string key such as `PROVIDER_NAME` into `Provider_Name`.
+fn clean_provider_key(key: &str) -> String {
+    let words: Vec<String> = key
+        .split('_')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        key.to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+/// Resolve the category folder for a driver.
 ///
 /// When the source is already organized into category folders (e.g. `01_Chipset`)
 /// the top-level folder is used. When the source is flat (one folder per OEM INF,
@@ -329,21 +404,35 @@ fn contains_inf(dir: &Path) -> bool {
     false
 }
 
-/// Compute the normalized folder name for a driver within a category.
-pub fn normalized_folder_name(category: &str, driver: &PackDriver) -> String {
-    let class = driver.device_class.as_deref().unwrap_or("Unknown");
-    let stem = crate::util::strip_inf_extension(&driver.inf_name);
+/// Compute the normalized folder name for a driver.
+///
+/// Format: `<Class>_<Provider>_<Version>_<InfName>`. The INF name keeps the
+/// folder unique when a provider ships several packages at the same version
+/// (e.g. `iigd_dch` and `iigd_dch_d`), which would otherwise collide.
+pub fn normalized_folder_name(driver: &PackDriver) -> String {
+    let class = driver
+        .device_class
+        .as_deref()
+        .map(|c| {
+            if is_placeholder_class(c) {
+                "Unknown".to_string()
+            } else {
+                canonical_class_name(c.trim())
+            }
+        })
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let provider = driver
+        .provider
+        .as_deref()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "Unknown".to_string());
+
     let version = clean_version(driver.driver_version.as_deref());
+    let inf_stem = crate::util::strip_inf_extension(&driver.inf_name);
 
-    // Prefer a class-derived label but fall back to the category when the class
-    // is missing or clearly a placeholder ("System ; TODO: edit Class").
-    let class_label = if is_placeholder_class(class) {
-        category.trim().to_string()
-    } else {
-        canonical_class_name(class.trim())
-    };
-
-    sanitize_folder_name(&format!("{}_{}_{}", class_label, stem, version))
+    sanitize_folder_name(&format!("{}_{}_{}_{}", class, provider, version, inf_stem))
 }
 
 /// Reduce an INF driver version to a compact token suitable for a folder name.
@@ -376,27 +465,37 @@ pub fn is_placeholder_class(class: &str) -> bool {
     lower.contains("todo") || lower.contains("unknown") || lower.trim().is_empty()
 }
 
-/// Maximum number of device names listed in a manifest row before summarising.
-pub const MAX_MANIFEST_DEVICE_NAMES: usize = 10;
+/// Maximum number of entries listed in a manifest row before summarising.
+pub const MAX_MANIFEST_LIST: usize = 10;
 
-/// Format a package's device names for the manifest.
+/// Format a list for the manifest, capped with a `+N more` suffix.
 ///
-/// Names are already unique and sorted. At most [`MAX_MANIFEST_DEVICE_NAMES`]
-/// are listed; the remainder is summarised as `+N more` so packages with
-/// hundreds of devices (e.g. GPU INFs) stay readable.
-pub fn format_device_names(names: &[String]) -> String {
-    if names.is_empty() {
+/// Items are expected to be unique and sorted. At most [`MAX_MANIFEST_LIST`] are
+/// listed so packages with hundreds of devices (e.g. GPU INFs) stay readable.
+pub fn format_list(items: &[String]) -> String {
+    format_list_capped(items, MAX_MANIFEST_LIST)
+}
+
+/// Format a list, capping at `max` items.
+pub fn format_list_capped(items: &[String], max: usize) -> String {
+    if items.is_empty() {
         return String::new();
     }
-    if names.len() <= MAX_MANIFEST_DEVICE_NAMES {
-        return names.join("; ");
+    if items.len() <= max {
+        return items.join("; ");
     }
-    let shown = names[..MAX_MANIFEST_DEVICE_NAMES].join("; ");
-    format!(
-        "{}; +{} more",
-        shown,
-        names.len() - MAX_MANIFEST_DEVICE_NAMES
-    )
+    let shown = items[..max].join("; ");
+    format!("{}; +{} more", shown, items.len() - max)
+}
+
+/// Format a package's device names for the manifest.
+pub fn format_device_names(names: &[String]) -> String {
+    format_list(names)
+}
+
+/// Format a package's hardware IDs for the manifest.
+pub fn format_hardware_ids(ids: &[String]) -> String {
+    format_list(ids)
 }
 
 #[cfg(test)]
@@ -421,6 +520,7 @@ mod tests {
             provider: Some("Intel".to_string()),
             device_count: 1,
             device_names: vec!["Intel(R) UHD Graphics".to_string()],
+            hardware_ids: vec!["PCI\\VEN_8086&DEV_4680".to_string()],
             category: Some(category.to_string()),
             inf_hash: hash.to_string(),
             files: vec![PathBuf::from(inf)],
@@ -429,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_name_uses_class_and_version() {
+    fn folder_name_uses_class_provider_version_inf() {
         let d = driver(
             "03_VGA",
             Path::new("src/03_VGA/Nvidia"),
@@ -439,13 +539,34 @@ mod tests {
             "h1",
         );
         assert_eq!(
-            normalized_folder_name("03_VGA", &d),
-            "Display_nvcvegpu_32.0.15.7705"
+            normalized_folder_name(&d),
+            "Display_Intel_32.0.15.7705_nvcvegpu"
         );
     }
 
     #[test]
-    fn placeholder_class_falls_back_to_category() {
+    fn folder_name_is_unique_per_inf() {
+        let a = driver(
+            "Display",
+            Path::new("src/a"),
+            "iigd_dch.inf",
+            "Display",
+            "32.0",
+            "h1",
+        );
+        let b = driver(
+            "Display",
+            Path::new("src/b"),
+            "iigd_dch_d.inf",
+            "Display",
+            "32.0",
+            "h2",
+        );
+        assert_ne!(normalized_folder_name(&a), normalized_folder_name(&b));
+    }
+
+    #[test]
+    fn placeholder_class_becomes_unknown() {
         let d = driver(
             "09_ANX",
             Path::new("src/09_ANX"),
@@ -455,9 +576,23 @@ mod tests {
             "h2",
         );
         assert_eq!(
-            normalized_folder_name("09_ANX", &d),
-            "09_ANX_ANXUcmCxCD_1.9.2.4"
+            normalized_folder_name(&d),
+            "Unknown_Intel_1.9.2.4_ANXUcmCxCD"
         );
+    }
+
+    #[test]
+    fn missing_provider_becomes_unknown() {
+        let mut d = driver(
+            "01_Chipset",
+            Path::new("src/a"),
+            "foo.inf",
+            "System",
+            "1.0",
+            "h",
+        );
+        d.provider = None;
+        assert_eq!(normalized_folder_name(&d), "System_Unknown_1.0_foo");
     }
 
     #[test]
@@ -471,8 +606,8 @@ mod tests {
             "h3",
         );
         assert_eq!(
-            normalized_folder_name("03_VGA", &d),
-            "System_CtaChildDriver_1.0.0.18"
+            normalized_folder_name(&d),
+            "System_Intel_1.0.0.18_CtaChildDriver"
         );
     }
 
@@ -486,7 +621,55 @@ mod tests {
             "",
             "h4",
         );
-        assert!(normalized_folder_name("01_Chipset", &d).ends_with("_NoVersion"));
+        assert!(
+            normalized_folder_name(&d).contains("_NoVersion_"),
+            "expected a NoVersion segment in {}",
+            normalized_folder_name(&d)
+        );
+    }
+
+    #[test]
+    fn merge_key_ignores_source_folder() {
+        // Same class + device name + version, different source folders/hashes.
+        let a = driver(
+            "Bluetooth",
+            Path::new("src/oem37"),
+            "ibtusb.inf",
+            "Bluetooth",
+            "23.150.0.3",
+            "hA",
+        );
+        let b = driver(
+            "Bluetooth",
+            Path::new("src/oem45"),
+            "ibtusb.inf",
+            "Bluetooth",
+            "23.150.0.3",
+            "hB",
+        );
+        assert_eq!(a.merge_key(), b.merge_key());
+        assert_ne!(a.inf_hash, b.inf_hash);
+    }
+
+    #[test]
+    fn merge_key_distinguishes_versions() {
+        let a = driver(
+            "Display",
+            Path::new("src/a"),
+            "x.inf",
+            "Display",
+            "1.0",
+            "h1",
+        );
+        let b = driver(
+            "Display",
+            Path::new("src/b"),
+            "x.inf",
+            "Display",
+            "2.0",
+            "h2",
+        );
+        assert_ne!(a.merge_key(), b.merge_key());
     }
 
     #[test]
@@ -530,5 +713,19 @@ mod tests {
     #[test]
     fn device_names_empty() {
         assert_eq!(format_device_names(&[]), "");
+    }
+
+    #[test]
+    fn hardware_ids_are_capped_like_names() {
+        let ids: Vec<String> = (0..12).map(|i| format!("PCI\\DEV_{}", i)).collect();
+        let out = format_hardware_ids(&ids);
+        assert!(out.ends_with("+2 more"));
+        assert!(out.starts_with("PCI\\DEV_0"));
+    }
+
+    #[test]
+    fn provider_key_is_humanised() {
+        assert_eq!(clean_provider_key("PROVIDER_NAME"), "Provider Name");
+        assert_eq!(clean_provider_key("Mfg"), "Mfg");
     }
 }

@@ -95,13 +95,39 @@ pub fn parse_inf_file(inf_path: &Path) -> Result<ParsedInfFile> {
         }
     }
 
-    let drivers = build_driver_info(
+    let mut drivers = build_driver_info(
         &device_sections,
         &manufacturers,
         &string_table,
         &version_info,
         &file_name,
     );
+
+    // Resolve `%StringKey%` references in the `[Version]` section (notably
+    // `Provider=%ManufacturerName%`) against the `[Strings]` table.
+    if let Some(provider) = &version_info.provider {
+        version_info.provider = Some(resolve_string(provider, &string_table));
+    }
+    if let Some(class) = &version_info.class {
+        version_info.class = Some(resolve_string(class, &string_table));
+    }
+    if let Some(catalog) = &version_info.catalog_file {
+        version_info.catalog_file = Some(resolve_string(catalog, &string_table));
+    }
+
+    // Keep per-device provider consistent with the resolved version provider.
+    if let Some(provider) = &version_info.provider {
+        for driver in &mut drivers {
+            if driver
+                .driver_provider_name
+                .as_deref()
+                .map(|p| p.starts_with('%') && p.ends_with('%'))
+                .unwrap_or(true)
+            {
+                driver.driver_provider_name = Some(provider.clone());
+            }
+        }
+    }
 
     Ok(ParsedInfFile {
         file_path: inf_path.to_path_buf(),
