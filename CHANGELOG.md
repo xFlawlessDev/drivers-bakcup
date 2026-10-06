@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.5 - Driver Pack Normalizer
+
+### Added
+
+- New `pack` command that normalizes a vendor driver pack into one consistent,
+  upload-ready layout plus a manifest. Handles the structural differences
+  between ODMs (nested category folders vs flat per-INF folders), per-OS
+  duplicate folders, mixed class casing, and INF-less installer folders.
+  - Discovers every INF package recursively.
+  - Groups by existing category folder, or by device class for flat packs.
+  - Canonicalizes device class casing (`net` -> `Net`) and cleans `stampinf`
+    version placeholders.
+  - Deduplicates by INF SHA-256 (e.g. 483 packages -> 179 unique on the
+    reference Clevo pack).
+  - Copies full package sub-trees (`Config/`, `ifwi/`, ...) while excluding
+    sibling packages.
+  - Emits `manifest.csv` (one row per package, with duplicate tracking) and
+    `summary.csv` (totals and per-class counts).
+  - Auto-detects ODM/model/revision from `autoins.ini` and folder names, with
+    CLI overrides.
+- Split the pack logic into `pack`, `pack_discover`, and `pack_meta` modules.
+
 ## v2.4 - Driver Store Coverage
 
 ### Internal Refactor

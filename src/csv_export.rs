@@ -301,3 +301,91 @@ pub fn export_backup_summary_csv(
 fn join_opt(values: impl Iterator<Item = Option<String>>) -> String {
     values.flatten().collect::<Vec<_>>().join("; ")
 }
+
+/// A row of the normalized driver pack manifest.
+pub struct ManifestRow {
+    pub pack: String,
+    pub odm: String,
+    pub model: String,
+    pub revision: String,
+    pub category: String,
+    pub device_class: String,
+    pub driver_name: String,
+    pub driver_version: String,
+    pub provider: String,
+    pub device_count: usize,
+    pub normalized_folder: String,
+    pub source_folder: String,
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub inf_hash: String,
+    pub duplicate_of: String,
+    pub status: String,
+}
+
+/// Write the normalized driver pack manifest CSV.
+pub fn write_pack_manifest(rows: &[ManifestRow], output_path: &Path) -> Result<()> {
+    let mut csv_content = String::from(
+        "Pack,ODM,Model,Revision,Category,Device Class,Driver Name,Driver Version,Provider,Device Count,Normalized Folder,Source Folder,File Count,Total Bytes,INF SHA256,Duplicate Of,Status\n",
+    );
+
+    for row in rows {
+        csv_content.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            escape_csv(&row.pack),
+            escape_csv(&row.odm),
+            escape_csv(&row.model),
+            escape_csv(&row.revision),
+            escape_csv(&row.category),
+            escape_csv(&row.device_class),
+            escape_csv(&row.driver_name),
+            escape_csv(&row.driver_version),
+            escape_csv(&row.provider),
+            row.device_count,
+            escape_csv(&row.normalized_folder),
+            escape_csv(&row.source_folder),
+            row.file_count,
+            row.total_bytes,
+            escape_csv(&row.inf_hash),
+            escape_csv(&row.duplicate_of),
+            escape_csv(&row.status),
+        ));
+    }
+
+    write_csv(output_path, &csv_content)
+}
+
+/// Write a machine-readable summary of a pack normalization run.
+pub fn write_pack_summary_csv(rows: &[ManifestRow], output_path: &Path) -> Result<()> {
+    let total = rows.len();
+    let unique = rows.iter().filter(|r| r.duplicate_of.is_empty()).count();
+    let duplicates = total - unique;
+    let total_bytes: u64 = rows
+        .iter()
+        .filter(|r| r.duplicate_of.is_empty())
+        .map(|r| r.total_bytes)
+        .sum();
+
+    let mut by_class: HashMap<&str, usize> = HashMap::new();
+    for row in rows.iter().filter(|r| r.duplicate_of.is_empty()) {
+        *by_class.entry(row.device_class.as_str()).or_insert(0) += 1;
+    }
+    let mut classes: Vec<_> = by_class.into_iter().collect();
+    classes.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut csv_content = String::from("Section,Key,Value\n");
+    csv_content.push_str(&format!("Totals,Driver Packages Found,{}\n", total));
+    csv_content.push_str(&format!("Totals,Unique Packages,{}\n", unique));
+    csv_content.push_str(&format!("Totals,Duplicate Packages,{}\n", duplicates));
+    csv_content.push_str(&format!("Totals,Unique Size Bytes,{}\n", total_bytes));
+    for (class, count) in classes {
+        csv_content.push_str(&format!("By Class,{},{}\n", escape_csv(class), count));
+    }
+
+    write_csv(output_path, &csv_content)
+}
+
+/// Return a stable relative path string for CSV output.
+pub fn relative_path_str(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}

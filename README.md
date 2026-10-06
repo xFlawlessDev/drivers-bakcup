@@ -43,6 +43,7 @@ Commands:
   inspect  Inspect a driver package (exe/zip/folder) for driver information
   scan     Scan a folder to identify and list all INF files
   export   Export connected device hardware IDs to CSV
+  pack     Normalize a vendor driver pack into an upload-ready layout
 ```
 
 ---
@@ -202,6 +203,112 @@ also exports driver files (same behavior as `backup`).
 | `--all` | `--all` | Include Microsoft drivers |
 | `-v` | `--verbose` | Detailed output |
 | `-f` | `--files` | Also export driver files |
+
+---
+
+## 5. Pack Command
+
+Normalizes a vendor driver pack into one consistent layout, then writes a
+manifest. Use this when ODM packs arrive with different structures (different
+nesting, per-OS sub-folders, mixed casing, duplicate INFs) and you need one
+predictable format for upload.
+
+```powershell
+# Normalize a pack, auto-detecting ODM/model/revision
+.\driver-backup.exe pack -p "D:\Drivers" -o "D:\Normalized"
+
+# Override the detected metadata
+.\driver-backup.exe pack -p "D:\Drivers" -o "D:\Normalized" --odm Clevo --model 765 --revision V2xxRNP_1.08.06_0911
+
+# Preview the planned layout without writing anything
+.\driver-backup.exe pack -p "D:\Drivers" -o "D:\Normalized" --dry-run
+
+# Only write the manifest, do not copy driver files
+.\driver-backup.exe pack -p "D:\Drivers" -o "D:\Normalized" --manifest-only
+```
+
+| Option | Long | Description |
+|--------|------|-------------|
+| `-p` | `--path <PATH>` | Source driver pack folder (required) |
+| `-o` | `--output <PATH>` | Output directory (default: `driver_pack`) |
+| | `--odm <NAME>` | Override the ODM name |
+| | `--model <ID>` | Override the model identifier |
+| | `--revision <REV>` | Override the pack revision |
+| | `--keep-duplicates` | Keep duplicate packages instead of collapsing them |
+| | `--manifest-only` | Write only the manifest; do not copy files |
+| `-d` | `--dry-run` | Preview the planned layout |
+| `-v` | `--verbose` | Per-package output |
+
+### What it does
+
+1. **Discovers** every driver package (INF) under the source, recursively.
+2. **Groups** each package by category:
+   - If the source already uses category folders (e.g. `01_Chipset`), that
+     top-level folder is the category.
+   - If the source is flat (one folder per OEM INF, as some ODMs ship), the
+     device class is used instead.
+3. **Normalizes** the device class casing (`net`/`NET` -> `Net`) and the driver
+   version (strips `stampinf` placeholders).
+4. **Deduplicates** packages by the SHA-256 of their INF. Byte-identical copies
+   (common across per-OS sub-folders such as `W2K12R2-x64` and
+   `Windows10-x64`) collapse into a single entry.
+5. **Copies** each unique package into `Drivers/<Category>/<Class>_<Name>_<Version>/`,
+   preserving package sub-folders (`Config/`, `DLLs/`, `ifwi/`, ...) but not
+   sibling packages.
+6. **Keeps** categories that have no INF (EXE/INI-only installers) as
+   `installer-only` entries so nothing is lost.
+7. **Writes** `manifest.csv` and `summary.csv`.
+
+### Output Structure
+
+```
+driver_pack/
+└── Clevo_765_V2xxRNP_1.08.06_0911/
+    ├── manifest.csv
+    ├── summary.csv
+    └── Drivers/
+        ├── Display/
+        │   └── Display_nvcvegpu_32.0.15.7705/
+        ├── MEDIA/
+        │   └── MEDIA_IntcDAud_11.2.0.13/
+        ├── Net/
+        │   └── Net_rt640x64_10.072.0524.2024/
+        └── 10_SBX/                    <- installer-only, no INF
+```
+
+### `manifest.csv`
+
+One row per discovered package.
+
+| Column | Description |
+|--------|-------------|
+| `Pack` | Pack slug (`ODM_Model_Revision`) |
+| `ODM` / `Model` / `Revision` | Pack metadata |
+| `Category` | Source category or device class |
+| `Device Class` | INF device class, canonicalized |
+| `Driver Name` | INF file name without extension |
+| `Driver Version` | Version from the INF |
+| `Provider` | Driver publisher |
+| `Device Count` | Devices the INF declares |
+| `Normalized Folder` | Destination path within the pack |
+| `Source Folder` | Original path in the source pack |
+| `File Count` / `Total Bytes` | Package size |
+| `INF SHA256` | Content hash used for dedup |
+| `Duplicate Of` | Normalized folder of the original, if a duplicate |
+| `Status` | `unique`, `duplicate`, or `installer-only` |
+
+### `summary.csv`
+
+Totals (packages found, unique, duplicates, size) and a per-class breakdown.
+
+### Metadata detection
+
+ODM, model, and revision are detected automatically, in order:
+
+1. CLI overrides (`--odm`, `--model`, `--revision`).
+2. `autoins.ini` at the pack root (e.g. `CDVersion`).
+3. Folder names, e.g. `765\V2xxRNP_1.08.06_0911\Drivers` or
+   `GemOne238TJ_270XJ_Drivers\Drivers`.
 
 ---
 

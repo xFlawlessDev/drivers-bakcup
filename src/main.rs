@@ -7,6 +7,9 @@ mod driver_store;
 mod inf_extract;
 mod inf_parser;
 mod models;
+mod pack;
+mod pack_discover;
+mod pack_meta;
 mod pnputil;
 mod scan;
 mod util;
@@ -93,6 +96,75 @@ fn run(command: Commands) -> Result<()> {
         } => {
             run_export(&output, all, verbose, files)?;
         }
+        Commands::Pack {
+            path,
+            output,
+            odm,
+            model,
+            revision,
+            keep_duplicates,
+            manifest_only,
+            dry_run,
+            verbose,
+        } => {
+            run_pack(
+                &path,
+                &output,
+                odm,
+                model,
+                revision,
+                keep_duplicates,
+                manifest_only,
+                dry_run,
+                verbose,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The `pack` command: normalize a vendor driver pack.
+#[allow(clippy::too_many_arguments)]
+fn run_pack(
+    path: &Path,
+    output: &Path,
+    odm: Option<String>,
+    model: Option<String>,
+    revision: Option<String>,
+    keep_duplicates: bool,
+    manifest_only: bool,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<()> {
+    // Start from best-effort detection, then apply explicit overrides.
+    let mut metadata = pack_meta::detect_metadata(path);
+    if odm.is_some() {
+        metadata.odm = odm;
+    }
+    if model.is_some() {
+        metadata.model = model;
+    }
+    if revision.is_some() {
+        metadata.revision = revision;
+    }
+
+    let opts = pack::PackOptions {
+        source: path.to_path_buf(),
+        output: output.to_path_buf(),
+        metadata,
+        dedup: !keep_duplicates,
+        copy_files: !manifest_only,
+        verbose,
+        dry_run,
+    };
+
+    let result = pack::run_pack(&opts)?;
+
+    if !dry_run && result.unique > 0 {
+        println!(
+            "\nDone. {} unique package(s), {} duplicate(s) collapsed.",
+            result.unique, result.duplicates
+        );
     }
     Ok(())
 }

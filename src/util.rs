@@ -1,6 +1,8 @@
 //! Shared helpers: CSV escaping, date formatting, folder-name sanitizing, and
 //! Microsoft-driver filtering.
 
+use std::path::Path;
+
 /// Escape a value for inclusion in a CSV field.
 ///
 /// Wraps the value in double quotes and doubles any embedded quotes when it
@@ -95,6 +97,23 @@ pub fn is_unsafe_path(path: &str) -> bool {
     path.contains("..") || path.contains('%')
 }
 
+/// Compute the SHA-256 of a file's contents, as a lowercase hex string.
+pub fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

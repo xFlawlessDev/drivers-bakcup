@@ -94,3 +94,56 @@ pub struct DriverStorePackage {
 /// One row of the device class legend:
 /// `(class name, class GUID, present device count, installed package count)`.
 pub type DeviceClassLegendEntry = (String, String, usize, usize);
+
+/// Metadata describing a driver pack release.
+#[derive(Debug, Clone, Default)]
+pub struct PackMetadata {
+    /// Original equipment manufacturer, e.g. `Clevo`.
+    pub odm: Option<String>,
+    /// Machine/model identifier, e.g. `765`.
+    pub model: Option<String>,
+    /// Pack revision reported by the ODM, e.g. `V2xxRNP_1.08.06_0911`.
+    pub revision: Option<String>,
+}
+
+impl PackMetadata {
+    /// A filesystem-safe identifier assembled from the available fields.
+    pub fn slug(&self) -> String {
+        let parts: Vec<String> = [&self.odm, &self.model, &self.revision]
+            .iter()
+            .filter_map(|p| p.as_deref())
+            .filter(|p| !p.is_empty())
+            .map(|p| crate::util::sanitize_folder_name(p).replace(' ', "_"))
+            .collect();
+        if parts.is_empty() {
+            "pack".to_string()
+        } else {
+            parts.join("_")
+        }
+    }
+}
+
+/// A driver package discovered while scanning a pack, ready to be normalized.
+#[derive(Debug, Clone)]
+pub struct PackDriver {
+    /// Source directory containing the driver's files.
+    pub source_dir: PathBuf,
+    /// INF file name, e.g. `iigd_dch.inf`.
+    pub inf_name: String,
+    /// Device class from the INF `[Version]` section.
+    pub device_class: Option<String>,
+    /// Driver version from the INF `[Version]` section.
+    pub driver_version: Option<String>,
+    /// Provider from the INF `[Version]` section.
+    pub provider: Option<String>,
+    /// Number of device entries the INF declares.
+    pub device_count: usize,
+    /// Top-level pack category the driver was found under, e.g. `01_Chipset`.
+    pub category: Option<String>,
+    /// SHA-256 of the INF file contents, used for duplicate detection.
+    pub inf_hash: String,
+    /// Files belonging to this package (relative to `source_dir`).
+    pub files: Vec<PathBuf>,
+    /// Total size in bytes of all package files.
+    pub total_bytes: u64,
+}
