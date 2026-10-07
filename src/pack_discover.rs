@@ -622,35 +622,28 @@ pub fn manifest_class_name(class: Option<&str>) -> String {
     }
 }
 
-/// Maximum number of entries listed in a manifest row before summarising.
-pub const MAX_MANIFEST_LIST: usize = 10;
-
-/// Format a list for the manifest, capped with a `+N more` suffix.
+/// Join manifest list values in full.
 ///
-/// Items are expected to be unique and sorted. At most [`MAX_MANIFEST_LIST`] are
-/// listed so packages with hundreds of devices (e.g. GPU INFs) stay readable.
+/// Nothing is truncated: these columns feed downstream metadata (driver upload),
+/// where the complete set of device names and hardware IDs is required. Empty
+/// and duplicate entries are removed and the result is stable-ordered.
 pub fn format_list(items: &[String]) -> String {
-    format_list_capped(items, MAX_MANIFEST_LIST)
+    let mut unique: Vec<&str> = items
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    unique.sort_unstable();
+    unique.dedup();
+    unique.join("; ")
 }
 
-/// Format a list, capping at `max` items.
-pub fn format_list_capped(items: &[String], max: usize) -> String {
-    if items.is_empty() {
-        return String::new();
-    }
-    if items.len() <= max {
-        return items.join("; ");
-    }
-    let shown = items[..max].join("; ");
-    format!("{}; +{} more", shown, items.len() - max)
-}
-
-/// Format a package's device names for the manifest.
+/// Format a package's device names for the manifest (complete).
 pub fn format_device_names(names: &[String]) -> String {
     format_list(names)
 }
 
-/// Format a package's hardware IDs for the manifest.
+/// Format a package's hardware IDs for the manifest (complete).
 pub fn format_hardware_ids(ids: &[String]) -> String {
     format_list(ids)
 }
@@ -859,11 +852,13 @@ mod tests {
     }
 
     #[test]
-    fn device_names_long_list_is_capped() {
+    fn device_names_long_list_is_complete() {
         let names: Vec<String> = (0..25).map(|i| format!("Dev{}", i)).collect();
         let out = format_device_names(&names);
-        assert!(out.ends_with("+15 more"));
-        assert!(out.starts_with("Dev0; Dev1"));
+        // Nothing is truncated, and no summary suffix is added.
+        assert!(!out.contains("more"));
+        assert_eq!(out.split("; ").count(), 25);
+        assert!(out.contains("Dev24"));
     }
 
     #[test]
@@ -872,11 +867,13 @@ mod tests {
     }
 
     #[test]
-    fn hardware_ids_are_capped_like_names() {
-        let ids: Vec<String> = (0..12).map(|i| format!("PCI\\DEV_{}", i)).collect();
+    fn hardware_ids_are_complete_and_deduped() {
+        let mut ids: Vec<String> = (0..12).map(|i| format!("PCI\\DEV_{}", i)).collect();
+        ids.push("PCI\\DEV_0".to_string()); // duplicate
         let out = format_hardware_ids(&ids);
-        assert!(out.ends_with("+2 more"));
-        assert!(out.starts_with("PCI\\DEV_0"));
+        assert!(!out.contains("more"));
+        assert_eq!(out.split("; ").count(), 12);
+        assert!(out.contains("PCI\\DEV_11"));
     }
 
     #[test]

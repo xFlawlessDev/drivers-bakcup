@@ -314,9 +314,9 @@ One row per **merged** driver package.
 | `Catalog` | Catalog (`.cat`) file the INF is signed under |
 | `Device Count` | Number of device entries across merged packages |
 | `Device Name Count` | Number of unique friendly device names |
-| `Device Names` | Up to 10 unique device names, then `+N more` |
+| `Device Names` | All unique device names, semicolon separated (never truncated) |
 | `Hardware ID Count` | Number of unique hardware IDs |
-| `Hardware IDs` | Up to 10 unique hardware IDs, then `+N more` |
+| `Hardware IDs` | All unique hardware IDs, semicolon separated (never truncated) |
 | `Normalized Folder` | Destination folder name |
 | `Source Folder` | Representative source path (the copied package) |
 | `Merged From` | Other source folders collapsed into this entry |

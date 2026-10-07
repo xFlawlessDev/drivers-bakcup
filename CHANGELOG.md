@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.6.3 - Complete Hardware IDs
+
+### Changed
+
+- `pack` no longer truncates `Device Names` and `Hardware IDs` in the manifest.
+  Every unique value is written in full, so the columns can be used directly as
+  driver-upload metadata. Previously they were capped at 10 with a `+N more`
+  suffix.
+- This makes the `pack` manifest columns match the `backup` summary, which
+  already wrote hardware IDs in full.
+
 ## v2.6.2 - Superseded Drivers
 
 ### Added

@@ -477,9 +477,7 @@ fn hardware_overlaps(a: &ManifestRow, b: &ManifestRow) -> bool {
     if set_a.is_empty() || set_b.is_empty() {
         return false;
     }
-    set_a
-        .iter()
-        .any(|id| !id.starts_with('+') && set_b.contains(id))
+    set_a.iter().any(|id| set_b.contains(id))
 }
 
 /// Parse a dotted version string into numeric components.
