@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.6 - Installer Bundling
+
+### Fixed
+
+- `pack` no longer duplicates shared payload. INFs that live in the same source
+  folder are treated as **one installer bundle** and copied once. Intel graphics
+  previously produced four equal-size folders (7 GB from a 1.7 GB source); it now
+  produces one package with all the INFs and shared files (`igdlh.cat`, 139 DLLs,
+  the `.sys` drivers).
+- Each INF now only claims the files it references, instead of every file in its
+  folder.
+
+### Changed
+
+- Two-phase grouping:
+  1. **Bundle** by source folder — INFs sharing a folder become one package.
+  2. **Merge** bundles describing the same driver (INF stem + device name +
+     version) — a driver shipped as many single-INF folders (Intel Bluetooth
+     `ibtusb` under `CCP`/`GAP`/...) becomes one package.
+- Folder naming reflects the grouping: a merged bundle is named after its INF
+  (`..._ibtusb`), a folder bundle after the folder (`..._Drivers`), and a single
+  INF after the catalog or INF stem.
+- `Status` is `package` for combined output, `unique` for a single INF.
+
 ## v2.5.4 - Pack Zipping and Driver Date
 
 ### Added

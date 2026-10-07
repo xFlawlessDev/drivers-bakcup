@@ -21,7 +21,7 @@ use crate::csv_export::{
 };
 use crate::models::{PackDriver, PackMetadata};
 use crate::pack_discover::{
-    clean_driver_date, clean_version, count_tree, discover_drivers,
+    bundle_label, clean_driver_date, clean_version, count_tree, discover_drivers,
     discover_installer_only_categories, format_device_names, format_hardware_ids,
     manifest_class_name, normalized_folder_name,
 };
@@ -128,12 +128,14 @@ pub fn run_pack(opts: &PackOptions) -> Result<PackResult> {
     Ok(PackResult { unique, duplicates })
 }
 
-/// A merged group of packages that describe the same driver.
-struct DriverGroup<'a> {
-    /// The representative package whose files will be copied.
+/// One installer bundle: INFs that share a source folder.
+struct Bundle<'a> {
+    /// The representative INF, used for the folder name and metadata.
     primary: &'a PackDriver,
-    /// Source folders of the other packages merged into this group.
-    others: Vec<&'a PackDriver>,
+    /// All INF names in this bundle (including the primary).
+    inf_names: Vec<String>,
+    /// Source folders contributing to this bundle.
+    source_dirs: Vec<PathBuf>,
     /// Union of device names across all members.
     device_names: Vec<String>,
     /// Union of hardware IDs across all members.
@@ -142,51 +144,152 @@ struct DriverGroup<'a> {
     device_count: usize,
 }
 
-/// Build the planned manifest rows.
+impl<'a> Bundle<'a> {
+    fn new(driver: &'a PackDriver) -> Self {
+        Self {
+            primary: driver,
+            inf_names: vec![driver.inf_name.clone()],
+            source_dirs: vec![driver.source_dir.clone()],
+            device_names: driver.device_names.clone(),
+            hardware_ids: driver.hardware_ids.clone(),
+            device_count: driver.device_count,
+        }
+    }
+
+    fn absorb(&mut self, driver: &'a PackDriver) {
+        if !self.inf_names.contains(&driver.inf_name) {
+            self.inf_names.push(driver.inf_name.clone());
+        }
+        if !self.source_dirs.contains(&driver.source_dir) {
+            self.source_dirs.push(driver.source_dir.clone());
+        }
+        self.device_names.extend(driver.device_names.clone());
+        self.hardware_ids.extend(driver.hardware_ids.clone());
+        self.device_count += driver.device_count;
+    }
+
+    /// Merge another bundle (same driver shipped in other folders).
+    fn merge(&mut self, other: &Bundle<'a>) {
+        for name in &other.inf_names {
+            if !self.inf_names.contains(name) {
+                self.inf_names.push(name.clone());
+            }
+        }
+        for dir in &other.source_dirs {
+            if !self.source_dirs.contains(dir) {
+                self.source_dirs.push(dir.clone());
+            }
+        }
+        self.device_names.extend(other.device_names.clone());
+        self.hardware_ids.extend(other.hardware_ids.clone());
+        self.device_count += other.device_count;
+    }
+}
+
+/// Group key identifying an installer bundle (INF + payload in one folder).
 ///
-/// Packages are grouped by [`PackDriver::merge_key`] (device class + device name +
-/// driver version), matching how the `export` command collapses a single driver
-/// that ships as several OEM packages. Pure duplicates (identical INF content)
-/// within a group are noted via `Duplicate Of`.
+/// A bundle is everything shipped in one source folder. Vendors stage a complete
+/// installer there and the payload (DLLs, `.cat`, `.sys`) is shared between every
+/// INF in it, so the folder is the correct unit to copy. Keying by folder rather
+/// than by catalog avoids splitting a multi-catalog folder — such as Intel
+/// graphics, which contains both `igdlh.cat` and `extinf.cat` — into two packages
+/// that each need the whole payload.
+fn bundle_key(driver: &PackDriver) -> String {
+    format!(
+        "dir:{}",
+        relative_path_str(&driver.source_dir).to_lowercase()
+    )
+}
+
+/// Merge key identifying the same driver shipped as several folder bundles.
+///
+/// Some vendors ship one driver as many single-INF folders (e.g. Intel Bluetooth
+/// `ibtusb` under `CCP`, `GAP`, `GFP`, ...). Their INFs differ slightly but the
+/// driver identity — INF stem + device name + version — is the same, so those
+/// bundles are merged into one output package.
+fn merge_bundle_key(bundle: &Bundle) -> String {
+    let primary = bundle.primary;
+    let inf_stem = crate::util::strip_inf_extension(&primary.inf_name).to_lowercase();
+    let device = bundle
+        .device_names
+        .first()
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+    let version = primary
+        .driver_version
+        .as_deref()
+        .unwrap_or("Unknown")
+        .trim()
+        .to_lowercase();
+    format!("{}|{}|{}", inf_stem, device, version)
+}
+
+/// Build the planned manifest rows, one per output package.
+///
+/// Two phases:
+/// 1. **Bundle** — INFs sharing a source folder become one installer bundle, so
+///    shared payload is copied once (e.g. Intel graphics: 11 INFs, one folder).
+/// 2. **Merge** — bundles describing the same driver (INF stem + device + version)
+///    are collapsed, so a driver shipped as many single-INF folders becomes one
+///    package (e.g. Intel Bluetooth `ibtusb` under `CCP`/`GAP`/...).
 fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
     let slug = opts.metadata.slug();
 
-    // Preserve first-seen order for stable output.
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, DriverGroup> = HashMap::new();
-
-    for (idx, driver) in drivers.iter().enumerate() {
-        let key = if opts.dedup {
-            driver.merge_key()
-        } else {
-            // Disable merging: make each package its own group.
-            format!("__{}__{}", idx, driver.inf_hash)
-        };
-
-        match groups.get_mut(&key) {
-            Some(group) => {
-                group.others.push(driver);
-                for name in &driver.device_names {
-                    group.device_names.push(name.clone());
-                }
-                for id in &driver.hardware_ids {
-                    group.hardware_ids.push(id.clone());
-                }
-                group.device_count += driver.device_count;
-            }
+    // Phase 1: bundle by source folder, preserving first-seen order.
+    let mut folder_order: Vec<String> = Vec::new();
+    let mut by_folder: HashMap<String, Bundle> = HashMap::new();
+    for driver in drivers {
+        let key = bundle_key(driver);
+        match by_folder.get_mut(&key) {
+            Some(bundle) => bundle.absorb(driver),
             None => {
-                order.push(key.clone());
-                groups.insert(
-                    key,
-                    DriverGroup {
-                        primary: driver,
-                        others: Vec::new(),
-                        device_names: driver.device_names.clone(),
-                        hardware_ids: driver.hardware_ids.clone(),
-                        device_count: driver.device_count,
-                    },
-                );
+                folder_order.push(key.clone());
+                by_folder.insert(key, Bundle::new(driver));
             }
+        }
+    }
+
+    // Phase 2: merge bundles that describe the same driver.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Bundle> = HashMap::new();
+    if opts.dedup {
+        for folder_key in &folder_order {
+            let bundle = &by_folder[folder_key];
+            let key = merge_bundle_key(bundle);
+            match groups.get_mut(&key) {
+                Some(existing) => existing.merge(bundle),
+                None => {
+                    order.push(key.clone());
+                    groups.insert(
+                        key,
+                        Bundle {
+                            primary: bundle.primary,
+                            inf_names: bundle.inf_names.clone(),
+                            source_dirs: bundle.source_dirs.clone(),
+                            device_names: bundle.device_names.clone(),
+                            hardware_ids: bundle.hardware_ids.clone(),
+                            device_count: bundle.device_count,
+                        },
+                    );
+                }
+            }
+        }
+    } else {
+        for (idx, folder_key) in folder_order.iter().enumerate() {
+            let bundle = &by_folder[folder_key];
+            let key = format!("__{}__", idx);
+            order.push(key.clone());
+            groups.insert(
+                key,
+                Bundle {
+                    primary: bundle.primary,
+                    inf_names: bundle.inf_names.clone(),
+                    source_dirs: bundle.source_dirs.clone(),
+                    device_names: bundle.device_names.clone(),
+                    hardware_ids: bundle.hardware_ids.clone(),
+                    device_count: bundle.device_count,
+                },
+            );
         }
     }
 
@@ -205,7 +308,8 @@ fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
 
         // Ensure the folder name is unique. Two distinct packages can otherwise
         // resolve to the same name (e.g. `heci.inf` shipped for win8 and win10).
-        let base_folder = normalized_folder_name(driver);
+        let label = bundle_label(driver, &group.inf_names, group.source_dirs.len());
+        let base_folder = normalized_folder_name(driver, &label);
         let folder = match used_folders.get_mut(&base_folder) {
             Some(count) => {
                 *count += 1;
@@ -218,22 +322,27 @@ fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
         };
 
         let source_rel = relative_path_str(&driver.source_dir);
-        let merged_from: Vec<String> = group
-            .others
+
+        // The folder holds every INF in the bundle; list them in the manifest.
+        let mut bundle_infs = group.inf_names.clone();
+        bundle_infs.sort();
+        bundle_infs.dedup();
+        let bundle_label = bundle_infs
             .iter()
-            .map(|d| relative_path_str(&d.source_dir))
+            .map(|n| crate::util::strip_inf_extension(n))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Extra source folders in the bundle (same catalog shipped elsewhere).
+        let merged_from: Vec<String> = group
+            .source_dirs
+            .iter()
+            .filter(|d| d.as_path() != driver.source_dir.as_path())
+            .map(|d| relative_path_str(d))
             .collect();
 
-        // Duplicates within the group: identical INF content to another member.
-        let duplicate_of = group
-            .others
-            .iter()
-            .find(|d| d.inf_hash == driver.inf_hash)
-            .map(|_| folder.clone())
-            .unwrap_or_default();
-
-        let status = if !merged_from.is_empty() {
-            "merged"
+        let status = if !merged_from.is_empty() || bundle_infs.len() > 1 {
+            "package"
         } else {
             "unique"
         };
@@ -248,7 +357,7 @@ fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
                 .clone()
                 .unwrap_or_else(|| "Uncategorized".to_string()),
             device_class: manifest_class_name(driver.device_class.as_deref()),
-            driver_name: crate::util::strip_inf_extension(&driver.inf_name).to_string(),
+            driver_name: bundle_label,
             driver_version: clean_version(driver.driver_version.as_deref()),
             driver_date: clean_driver_date(driver.driver_date.as_deref()),
             provider: driver
@@ -267,7 +376,7 @@ fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
             file_count: driver.files.len(),
             total_bytes: driver.total_bytes,
             inf_hash: driver.inf_hash.clone(),
-            duplicate_of,
+            duplicate_of: String::new(),
             status: status.to_string(),
         });
     }
@@ -325,11 +434,14 @@ fn materialize(
     pack_root: &Path,
     verbose: bool,
 ) -> Result<()> {
-    // Map source folder -> driver so we can copy the right files.
-    let by_source: HashMap<String, &PackDriver> = drivers
-        .iter()
-        .map(|d| (relative_path_str(&d.source_dir), d))
-        .collect();
+    // Map source folder -> every INF discovered there.
+    let mut by_source: HashMap<String, Vec<&PackDriver>> = HashMap::new();
+    for d in drivers {
+        by_source
+            .entry(relative_path_str(&d.source_dir))
+            .or_default()
+            .push(d);
+    }
 
     for row in rows {
         // Installer-only categories are copied as whole trees.
@@ -350,34 +462,56 @@ fn materialize(
             continue;
         }
 
-        // Merged groups are represented by their primary package; the other
-        // members are recorded in `Merged From` but not copied again.
-        let driver = match by_source.get(&row.source_folder) {
-            Some(d) => *d,
-            None => continue,
-        };
-
         let dest = pack_root.join(&row.normalized_folder);
         fs::create_dir_all(&dest)
             .with_context(|| format!("Failed to create {}", dest.display()))?;
 
-        for file in &driver.files {
-            let src = driver.source_dir.join(file);
-            if src.is_dir() {
+        // Source folders that contribute to this bundle: the representative's
+        // folder plus any other members recorded in `Merged From`.
+        let mut source_folders: Vec<PathBuf> = vec![driver_source_folder(row, &by_source)];
+        for extra in row.merged_from.split("; ") {
+            let extra = extra.trim();
+            if extra.is_empty() {
                 continue;
             }
-            let target = dest.join(file);
-            if let Some(parent) = target.parent() {
-                let _ = fs::create_dir_all(parent);
+            let folder = PathBuf::from(extra.replace('/', "\\"));
+            if folder.is_dir() {
+                source_folders.push(folder);
             }
-            if let Err(e) = fs::copy(&src, &target) {
-                if verbose {
-                    eprintln!(
-                        "Warning: failed to copy {} -> {}: {}",
-                        src.display(),
-                        target.display(),
-                        e
-                    );
+        }
+
+        for source_dir in &source_folders {
+            // Every INF that lives in this source folder belongs to the bundle.
+            let infs: Vec<&str> = by_source
+                .get(&relative_path_str(source_dir))
+                .map(|v| v.iter().map(|d| d.inf_name.as_str()).collect())
+                .unwrap_or_default();
+
+            // Shared payload (non-INF files and non-package subfolders).
+            let mut files = crate::pack_discover::collect_bundle_extra_files(source_dir);
+            // Ensure every INF in the folder is included.
+            files.extend(infs.iter().map(PathBuf::from));
+            files.sort();
+            files.dedup();
+
+            for file in &files {
+                let src = source_dir.join(file);
+                if src.is_dir() {
+                    continue;
+                }
+                let target = dest.join(file);
+                if let Some(parent) = target.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Err(e) = fs::copy(&src, &target) {
+                    if verbose {
+                        eprintln!(
+                            "Warning: failed to copy {} -> {}: {}",
+                            src.display(),
+                            target.display(),
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -391,6 +525,23 @@ fn materialize(
     }
 
     Ok(())
+}
+
+/// Resolve the representative source folder for a manifest row.
+fn driver_source_folder(
+    row: &ManifestRow,
+    by_source: &HashMap<String, Vec<&PackDriver>>,
+) -> PathBuf {
+    let direct = PathBuf::from(row.source_folder.replace('/', "\\"));
+    if direct.is_dir() {
+        return direct;
+    }
+    // Fall back to any known source folder whose bundle matches this row.
+    by_source
+        .keys()
+        .find(|k| k.ends_with(&row.source_folder))
+        .map(|k| PathBuf::from(k.replace('/', "\\")))
+        .unwrap_or(direct)
 }
 
 /// Recursively copy a directory tree.
@@ -500,6 +651,7 @@ mod tests {
             driver_version: Some(version.to_string()),
             driver_date: Some("01/15/2025".to_string()),
             provider: Some("Intel".to_string()),
+            catalog_file: None,
             device_count: 1,
             device_names: vec!["Intel(R) UHD Graphics".to_string()],
             hardware_ids: vec!["PCI\\VEN_8086&DEV_4680".to_string()],
@@ -529,93 +681,130 @@ mod tests {
     }
 
     #[test]
-    fn merges_same_driver_from_multiple_oem_packages() {
-        // oem37..oem45 style: same class+device+version, different INF hashes.
-        let ds = vec![
-            driver(
-                "Bluetooth",
-                Path::new("src/oem37"),
-                "ibtusb.inf",
-                "Bluetooth",
-                "23.150.0.3",
-                "hA",
-            ),
-            driver(
-                "Bluetooth",
-                Path::new("src/oem38"),
-                "ibtusb.inf",
-                "Bluetooth",
-                "23.150.0.3",
-                "hB",
-            ),
-            driver(
-                "Bluetooth",
-                Path::new("src/oem45"),
-                "ibtusb.inf",
-                "Bluetooth",
-                "23.150.0.3",
-                "hC",
-            ),
-        ];
-        let rows = plan_layout(&ds, &opts());
-        assert_eq!(rows.len(), 1, "should merge into a single package");
-        assert_eq!(rows[0].status, "merged");
-        assert_eq!(
-            rows[0].normalized_folder,
-            "Bluetooth_Intel_23.150.0.3_ibtusb"
+    fn bundles_infs_in_the_same_folder() {
+        // Intel graphics style: one folder, several INFs, shared payload.
+        let mut a = driver(
+            "03_Graphics",
+            Path::new("src/Drivers"),
+            "iigd_dch.inf",
+            "Display",
+            "31.0.101.5081",
+            "hA",
         );
-        assert!(rows[0].merged_from.contains("oem38"));
-        assert!(rows[0].merged_from.contains("oem45"));
+        a.catalog_file = Some("igdlh.cat".to_string());
+        let mut b = driver(
+            "03_Graphics",
+            Path::new("src/Drivers"),
+            "iigd_dch_d.inf",
+            "Display",
+            "31.0.101.5081",
+            "hB",
+        );
+        b.catalog_file = Some("igdlh.cat".to_string());
+        let mut c = driver(
+            "03_Graphics",
+            Path::new("src/Drivers"),
+            "iigd_ext.inf",
+            "Extension",
+            "31.0.101.5081",
+            "hC",
+        );
+        c.catalog_file = Some("extinf.cat".to_string());
+
+        let rows = plan_layout(&[a, b, c], &opts());
+        assert_eq!(rows.len(), 1, "INFs in one folder form one package");
+        assert_eq!(rows[0].status, "package");
+        assert!(rows[0].driver_name.contains("iigd_dch"));
+        assert!(rows[0].driver_name.contains("iigd_ext"));
     }
 
     #[test]
-    fn does_not_merge_different_versions() {
-        let ds = vec![
-            driver(
-                "Display",
-                Path::new("src/a"),
-                "x.inf",
-                "Display",
-                "1.0",
-                "h1",
-            ),
-            driver(
-                "Display",
-                Path::new("src/b"),
-                "x.inf",
-                "Display",
-                "2.0",
-                "h2",
-            ),
-        ];
-        let rows = plan_layout(&ds, &opts());
+    fn different_folders_stay_separate() {
+        let a = driver(
+            "Display",
+            Path::new("src/a"),
+            "iigd_dch.inf",
+            "Display",
+            "31.0",
+            "h1",
+        );
+        let b = driver(
+            "Net",
+            Path::new("src/b"),
+            "rt640x64.inf",
+            "Net",
+            "10.0",
+            "h2",
+        );
+
+        let rows = plan_layout(&[a, b], &opts());
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
     fn keep_duplicates_disables_merging() {
+        // Same driver in two folders; merging would collapse them.
+        let a = driver(
+            "Bluetooth",
+            Path::new("src/CCP"),
+            "ibtusb.inf",
+            "Bluetooth",
+            "1.0",
+            "h1",
+        );
+        let b = driver(
+            "Bluetooth",
+            Path::new("src/GAP"),
+            "ibtusb.inf",
+            "Bluetooth",
+            "1.0",
+            "h2",
+        );
+
+        // With merging on they collapse to one package.
+        assert_eq!(plan_layout(&[a.clone(), b.clone()], &opts()).len(), 1);
+
+        // With merging off each folder stays its own package.
+        let mut o = opts();
+        o.dedup = false;
+        let rows = plan_layout(&[a, b], &o);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn merges_same_driver_across_folders() {
+        // Intel Bluetooth style: one INF per folder, same driver.
         let ds = vec![
             driver(
                 "Bluetooth",
-                Path::new("src/a"),
+                Path::new("src/CCP"),
                 "ibtusb.inf",
                 "Bluetooth",
-                "1.0",
-                "h1",
+                "23.60.0.1",
+                "hA",
             ),
             driver(
                 "Bluetooth",
-                Path::new("src/b"),
+                Path::new("src/GAP"),
                 "ibtusb.inf",
                 "Bluetooth",
-                "1.0",
-                "h2",
+                "23.60.0.1",
+                "hB",
+            ),
+            driver(
+                "Bluetooth",
+                Path::new("src/GFP"),
+                "ibtusb.inf",
+                "Bluetooth",
+                "23.60.0.1",
+                "hC",
             ),
         ];
-        let mut o = opts();
-        o.dedup = false;
-        let rows = plan_layout(&ds, &o);
-        assert_eq!(rows.len(), 2);
+        let rows = plan_layout(&ds, &opts());
+        assert_eq!(rows.len(), 1, "same driver across folders merges");
+        assert_eq!(rows[0].status, "package");
+        assert!(rows[0].merged_from.contains("GAP"));
+        assert!(rows[0].merged_from.contains("GFP"));
     }
 
     #[test]
@@ -636,10 +825,10 @@ mod tests {
     }
 
     #[test]
-    fn merged_group_unions_hardware_ids() {
+    fn bundled_package_unions_hardware_ids() {
         let mut a = driver("Net", Path::new("src/a"), "rt.inf", "Net", "1.0", "h1");
         a.hardware_ids = vec!["PCI\\VEN_10EC&DEV_8168".to_string()];
-        let mut b = driver("Net", Path::new("src/b"), "rt.inf", "Net", "1.0", "h2");
+        let mut b = driver("Net", Path::new("src/a"), "rt2.inf", "Net", "1.0", "h2");
         b.hardware_ids = vec!["PCI\\VEN_10EC&DEV_8125".to_string()];
 
         let rows = plan_layout(&[a, b], &opts());

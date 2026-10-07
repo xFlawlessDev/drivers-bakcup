@@ -250,20 +250,21 @@ predictable format for upload.
 ### What it does
 
 1. **Discovers** every driver package (INF) under the source, recursively.
-2. **Groups** packages that describe the same driver. Packages are merged by
-   **device class + device name + driver version**, matching how `export`
-   collapses a single driver that a vendor ships as many OEM packages. For
-   example nine `ibtusb` folders (`oem37`..`oem45`) become one entry with the
-   union of their hardware IDs.
-3. **Normalizes** the device class casing (`net`/`NET` -> `Net`), resolves the
+2. **Bundles** INFs that live in the same source folder into one package, so the
+   shared payload (`ldl`, `.cat`, `.sys`) is copied once. Intel graphics ships
+   `iigd_dch`, `iigd_dch_d`, `iigd_ext`, `iigd_ext_d`, `cui_dch` and `memcntrl`
+   in one folder sharing `igdlh.cat`, so they become a single package.
+3. **Merges** bundles that describe the same driver (INF stem + device name +
+   version). A driver shipped as many single-INF folders — Intel Bluetooth
+   `ibtusb` under `CCP`/`GAP`/`GFP`/... — becomes one package with the union of
+   its hardware IDs, and the other folders are listed in `Merged From`.
+4. **Normalizes** the device class casing (`net`/`NET` -> `Net`), resolves the
    provider reference (`%ManufacturerName%` -> `Intel`), and cleans `stampinf`
    version placeholders.
-4. **Detects duplicates** by INF SHA-256 within a merged group and records them
-   in `Duplicate Of`.
 5. **Copies** each unique package to a flat folder named
-   `<Class>_<Provider>_<Version>_<InfName>` directly under the pack root,
-   preserving package sub-folders (`Config/`, `ifwi/`, ...) but not sibling
-   packages. A numeric suffix is appended when two packages would collide.
+   `<Class>_<Provider>_<Version>_<Bundle>` directly under the pack root, keeping
+   package sub-folders (`Config/`, `ifwi/`, ...). A numeric suffix is appended
+   when two packages would collide.
 6. **Keeps** categories that have no INF (EXE/INI-only installers) as
    `installer-only` entries so nothing is lost.
 7. **Writes** `manifest.csv` and `summary.csv`.

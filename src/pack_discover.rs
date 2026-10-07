@@ -62,6 +62,15 @@ pub fn discover_drivers(source: &Path, verbose: bool) -> Result<Vec<PackDriver>>
         // so folder names and the manifest show a real provider name.
         let provider = resolve_provider(&parsed);
 
+        // Normalize the catalog file name so INFs that share a catalog (and are
+        // therefore one installer bundle) can be grouped reliably.
+        let catalog_file = parsed
+            .raw_version_info
+            .catalog_file
+            .as_deref()
+            .map(|c| c.trim().to_lowercase())
+            .filter(|c| !c.is_empty());
+
         // Unique, sorted friendly device names for the manifest.
         let mut device_names: Vec<String> = parsed
             .drivers
@@ -90,6 +99,7 @@ pub fn discover_drivers(source: &Path, verbose: bool) -> Result<Vec<PackDriver>>
             driver_version: parsed.raw_version_info.driver_version.clone(),
             driver_date: parsed.raw_version_info.driver_date.clone(),
             provider,
+            catalog_file,
             device_count: parsed.drivers.len(),
             device_names,
             hardware_ids,
@@ -333,33 +343,80 @@ pub fn count_tree(dir: &Path) -> (usize, u64) {
     (files, bytes)
 }
 
-/// Collect the files that belong to a driver package.
+/// Collect the files that belong to a driver INF.
 ///
-/// A package is the INF plus everything under its own folder, excluding nested
-/// folders that themselves contain an INF (those are separate packages). This
-/// keeps self-contained bundles (with `Config/`, `DLLs/`, etc.) intact without
-/// swallowing sibling packages.
+/// Only the INF and the files it actually references (its catalog plus files
+/// named in the INF) are attributed to a single INF. Shared payload in the same
+/// folder (common for multi-INF bundles such as Intel graphics) is attributed
+/// to the bundle instead, so it is not duplicated per INF.
 fn collect_package_files(source_dir: &Path, inf_name: &str) -> Vec<PathBuf> {
-    let mut files = Vec::new();
+    let mut files = vec![PathBuf::from(inf_name)];
 
-    // The INF itself.
-    files.push(PathBuf::from(inf_name));
+    let inf_path = source_dir.join(inf_name);
+    let content = match read_text_lossy(&inf_path) {
+        Some(c) => c.to_lowercase(),
+        None => {
+            files.sort();
+            files.dedup();
+            return files;
+        }
+    };
 
     if let Ok(entries) = fs::read_dir(source_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // Skip sub-folders that are their own driver package.
-                if contains_inf(&path) {
-                    continue;
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.eq_ignore_ascii_case(inf_name) {
+                continue;
+            }
+            // Attribute a file to this INF only when the INF names it.
+            if content.contains(&name.to_lowercase()) {
+                files.push(PathBuf::from(name));
+            }
+        }
+    }
+
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Read a file as text, handling UTF-16 BOMs; `None` on failure.
+fn read_text_lossy(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let units: Vec<u16> = bytes[2..]
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return Some(String::from_utf16_lossy(&units));
+    }
+    Some(String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// Collect every file directly inside `source_dir` (the shared bundle payload).
+///
+/// Used when several INFs share one folder: the non-INF files are attributed to
+/// the bundle once rather than to each INF.
+pub fn collect_bundle_extra_files(source_dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(source_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Include sub-trees that are not themselves driver packages.
+                if !contains_inf(&path) {
+                    collect_tree_files(source_dir, &path, &mut files);
                 }
-                collect_tree_files(source_dir, &path, &mut files);
             } else {
                 files.push(PathBuf::from(entry.file_name()));
             }
         }
     }
-
     files.sort();
     files.dedup();
     files
@@ -405,12 +462,13 @@ fn contains_inf(dir: &Path) -> bool {
     false
 }
 
-/// Compute the normalized folder name for a driver.
+/// Compute the normalized folder name for an installer bundle.
 ///
-/// Format: `<Class>_<Provider>_<Version>_<InfName>`. The INF name keeps the
-/// folder unique when a provider ships several packages at the same version
-/// (e.g. `iigd_dch` and `iigd_dch_d`), which would otherwise collide.
-pub fn normalized_folder_name(driver: &PackDriver) -> String {
+/// Format: `<Class>_<Provider>_<Version>_<Bundle>`, where `<Bundle>` is the
+/// catalog stem when the bundle shares one (e.g. `igdlh`), otherwise the primary
+/// INF stem. This keeps single-INF packages specific while giving multi-INF
+/// bundles (Intel graphics) one shared, recognizable name.
+pub fn normalized_folder_name(driver: &PackDriver, bundle_label: &str) -> String {
     let class = driver
         .device_class
         .as_deref()
@@ -431,9 +489,51 @@ pub fn normalized_folder_name(driver: &PackDriver) -> String {
         .unwrap_or_else(|| "Unknown".to_string());
 
     let version = clean_version(driver.driver_version.as_deref());
-    let inf_stem = crate::util::strip_inf_extension(&driver.inf_name);
 
-    sanitize_folder_name(&format!("{}_{}_{}_{}", class, provider, version, inf_stem))
+    sanitize_folder_name(&format!(
+        "{}_{}_{}_{}",
+        class, provider, version, bundle_label
+    ))
+}
+
+/// The bundle label used in folder names.
+///
+/// For a merged bundle (same driver in several folders) the INF stem is the
+/// clearest label. For a folder bundle (several INFs sharing payload) the source
+/// folder name is used, since the INFs differ. Falls back to the catalog stem and
+/// then the primary INF stem.
+pub fn bundle_label(driver: &PackDriver, inf_names: &[String], source_count: usize) -> String {
+    // Merged across folders: label by the driver's INF.
+    if source_count > 1 {
+        return file_stem(&driver.inf_name);
+    }
+
+    // Single folder with several INFs: label by the folder.
+    if inf_names.len() > 1 {
+        if let Some(name) = driver.source_dir.file_name() {
+            let name = name.to_string_lossy().to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+
+    // Single INF: prefer the catalog stem, then the INF stem.
+    if let Some(cat) = &driver.catalog_file {
+        let stem = file_stem(cat);
+        if !stem.is_empty() {
+            return stem;
+        }
+    }
+    file_stem(&driver.inf_name)
+}
+
+/// Strip the final extension from a file name (`igdlh.cat` -> `igdlh`).
+fn file_stem(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem.to_string(),
+        _ => name.to_string(),
+    }
 }
 
 /// Reduce an INF driver version to a compact token suitable for a folder name.
@@ -580,6 +680,7 @@ mod tests {
             driver_version: Some(version.to_string()),
             driver_date: Some("01/15/2025".to_string()),
             provider: Some("Intel".to_string()),
+            catalog_file: None,
             device_count: 1,
             device_names: vec!["Intel(R) UHD Graphics".to_string()],
             hardware_ids: vec!["PCI\\VEN_8086&DEV_4680".to_string()],
@@ -600,14 +701,45 @@ mod tests {
             "32.0.15.7705",
             "h1",
         );
+        let label = bundle_label(&d, &["nvcvegpu.inf".to_string()], 1);
         assert_eq!(
-            normalized_folder_name(&d),
+            normalized_folder_name(&d, &label),
             "Display_Intel_32.0.15.7705_nvcvegpu"
         );
     }
 
     #[test]
-    fn folder_name_is_unique_per_inf() {
+    fn bundle_label_for_folder_bundle_uses_folder_name() {
+        // Several INFs share a folder: label by the folder.
+        let mut d = driver(
+            "Display",
+            Path::new("src/03_Graphics/Drivers"),
+            "iigd_dch.inf",
+            "Display",
+            "31.0",
+            "h1",
+        );
+        d.catalog_file = Some("igdlh.cat".to_string());
+        let infs = vec!["iigd_dch.inf".to_string(), "iigd_ext.inf".to_string()];
+        assert_eq!(bundle_label(&d, &infs, 1), "Drivers");
+    }
+
+    #[test]
+    fn bundle_label_for_merged_bundle_uses_inf_stem() {
+        // Same INF name across several folders: label by the INF.
+        let d = driver(
+            "Bluetooth",
+            Path::new("src/CCP"),
+            "ibtusb.inf",
+            "Bluetooth",
+            "23.60.0.1",
+            "h1",
+        );
+        assert_eq!(bundle_label(&d, &["ibtusb.inf".to_string()], 8), "ibtusb");
+    }
+
+    #[test]
+    fn folder_name_is_unique_per_source_folder() {
         let a = driver(
             "Display",
             Path::new("src/a"),
@@ -624,7 +756,12 @@ mod tests {
             "32.0",
             "h2",
         );
-        assert_ne!(normalized_folder_name(&a), normalized_folder_name(&b));
+        let la = bundle_label(&a, &["iigd_dch.inf".to_string()], 1);
+        let lb = bundle_label(&b, &["iigd_dch_d.inf".to_string()], 1);
+        assert_ne!(
+            normalized_folder_name(&a, &la),
+            normalized_folder_name(&b, &lb)
+        );
     }
 
     #[test]
@@ -637,8 +774,9 @@ mod tests {
             "1.9.2.4",
             "h2",
         );
+        let label = bundle_label(&d, &["ANXUcmCxCD.inf".to_string()], 1);
         assert_eq!(
-            normalized_folder_name(&d),
+            normalized_folder_name(&d, &label),
             "Unknown_Intel_1.9.2.4_ANXUcmCxCD"
         );
     }
@@ -654,7 +792,8 @@ mod tests {
             "h",
         );
         d.provider = None;
-        assert_eq!(normalized_folder_name(&d), "System_Unknown_1.0_foo");
+        let label = bundle_label(&d, &["foo.inf".to_string()], 1);
+        assert_eq!(normalized_folder_name(&d, &label), "System_Unknown_1.0_foo");
     }
 
     #[test]
@@ -667,8 +806,9 @@ mod tests {
             "1.0.0.18; TODO: set DriverVer in stampinf property pages",
             "h3",
         );
+        let label = bundle_label(&d, &["CtaChildDriver.inf".to_string()], 1);
         assert_eq!(
-            normalized_folder_name(&d),
+            normalized_folder_name(&d, &label),
             "System_Intel_1.0.0.18_CtaChildDriver"
         );
     }
@@ -683,55 +823,13 @@ mod tests {
             "",
             "h4",
         );
+        let label = bundle_label(&d, &["foo.inf".to_string()], 1);
+        let name = normalized_folder_name(&d, &label);
         assert!(
-            normalized_folder_name(&d).contains("_NoVersion_"),
+            name.contains("_NoVersion_"),
             "expected a NoVersion segment in {}",
-            normalized_folder_name(&d)
+            name
         );
-    }
-
-    #[test]
-    fn merge_key_ignores_source_folder() {
-        // Same class + device name + version, different source folders/hashes.
-        let a = driver(
-            "Bluetooth",
-            Path::new("src/oem37"),
-            "ibtusb.inf",
-            "Bluetooth",
-            "23.150.0.3",
-            "hA",
-        );
-        let b = driver(
-            "Bluetooth",
-            Path::new("src/oem45"),
-            "ibtusb.inf",
-            "Bluetooth",
-            "23.150.0.3",
-            "hB",
-        );
-        assert_eq!(a.merge_key(), b.merge_key());
-        assert_ne!(a.inf_hash, b.inf_hash);
-    }
-
-    #[test]
-    fn merge_key_distinguishes_versions() {
-        let a = driver(
-            "Display",
-            Path::new("src/a"),
-            "x.inf",
-            "Display",
-            "1.0",
-            "h1",
-        );
-        let b = driver(
-            "Display",
-            Path::new("src/b"),
-            "x.inf",
-            "Display",
-            "2.0",
-            "h2",
-        );
-        assert_ne!(a.merge_key(), b.merge_key());
     }
 
     #[test]

@@ -138,6 +138,11 @@ pub struct PackDriver {
     pub driver_date: Option<String>,
     /// Provider from the INF `[Version]` section.
     pub provider: Option<String>,
+    /// Catalog (`.cat`) file referenced by the INF `[Version]` section.
+    ///
+    /// Infos in the same source folder that share a catalog are treated as one
+    /// installer bundle (they are covered by a single signature).
+    pub catalog_file: Option<String>,
     /// Number of device entries the INF declares.
     pub device_count: usize,
     /// Unique friendly device names the INF supports, sorted.
@@ -152,33 +157,4 @@ pub struct PackDriver {
     pub files: Vec<PathBuf>,
     /// Total size in bytes of all package files.
     pub total_bytes: u64,
-}
-
-impl PackDriver {
-    /// Identity used to merge packages that describe the same driver.
-    ///
-    /// Different OEM packages can ship the same driver with slightly different
-    /// INFs (and therefore different file hashes). They should still collapse to
-    /// one entry, matching how the `export` command groups by device class + name
-    /// + version.
-    pub fn merge_key(&self) -> String {
-        let class = self
-            .device_class
-            .as_deref()
-            .unwrap_or("Unknown")
-            .trim()
-            .to_lowercase();
-        let name = self
-            .device_names
-            .first()
-            .map(|s| s.trim().to_lowercase())
-            .unwrap_or_default();
-        let version = self
-            .driver_version
-            .as_deref()
-            .unwrap_or("Unknown")
-            .trim()
-            .to_lowercase();
-        format!("{}|{}|{}", class, name, version)
-    }
 }
