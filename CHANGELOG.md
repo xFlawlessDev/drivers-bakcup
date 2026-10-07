@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.6.2 - Superseded Drivers
+
+### Added
+
+- The pack manifest reports when a older version of the same driver ships
+  alongside a newer one. Rows get `Status=superseded` and a `Superseded By`
+  column pointing at the newer package. Detection compares rows by INF name and
+  hardware-ID overlap; the higher driver version wins. For example
+  `mshdadac` 30.0.101.1371 is superseded by 31.0.101.2125, and `RealtekAPO`
+  12.0.6000.1167 by 13.0.6000.1167. Both versions are still kept, since Windows
+  ranks them by version.
+
 ## v2.6.1 - Clearer Package Labels
 
 ### Changed

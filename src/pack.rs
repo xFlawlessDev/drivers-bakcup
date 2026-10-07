@@ -83,6 +83,12 @@ pub fn run_pack(opts: &PackOptions) -> Result<PackResult> {
 
     let mut rows = plan_layout(&drivers, opts);
 
+    // Mark packages that a newer version of the same driver supersedes.
+    let superseded = mark_superseded(&mut rows);
+    if superseded > 0 {
+        println!("Superseded packages: {}", superseded);
+    }
+
     // Categories with no INF (e.g. vendor EXE installers) are still part of the
     // pack; emit a manifest row so they are not silently lost.
     append_installer_only_rows(&mut rows, &installer_only, opts);
@@ -377,6 +383,7 @@ fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
             source_folder: source_rel,
             merged_from: merged_from.join("; "),
             archive: String::new(),
+            superseded_by: String::new(),
             file_count: driver.files.len(),
             total_bytes: driver.total_bytes,
             inf_hash: driver.inf_hash.clone(),
@@ -386,6 +393,115 @@ fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
     }
 
     rows
+}
+
+/// Mark packages that a newer version supersedes.
+///
+/// A pack can ship two versions of the same driver (for example `mshdadac`
+/// 30.0.101.1371 and 31.0.101.2125). Both are kept — Windows ranks them by
+/// version — but older ones are flagged so QA can see which is current.
+///
+/// Two rows are compared when they share the same INF name and at least one
+/// hardware ID, and the older version is marked. Overlap (not exact equality) is
+/// used because a newer INF often lists a subset of the older one's IDs.
+///
+/// Returns the number of rows marked `superseded`.
+fn mark_superseded(rows: &mut [ManifestRow]) -> usize {
+    // Group row indices by INF name so only related packages are compared.
+    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, row) in rows.iter().enumerate() {
+        if row.status == "installer-only" || row.hardware_ids.is_empty() {
+            continue;
+        }
+        by_name
+            .entry(row.driver_name.to_lowercase())
+            .or_default()
+            .push(idx);
+    }
+
+    // Collect (old_idx, superseding_folder) pairs first to avoid borrowing rows
+    // mutably while reading them.
+    let mut marks: Vec<(usize, String)> = Vec::new();
+
+    for indices in by_name.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+
+        for &candidate in indices {
+            // Find the highest version among rows that overlap this candidate's
+            // hardware IDs and share its source folder family.
+            let mut best: Option<(usize, Vec<u64>)> = None;
+
+            for &other in indices {
+                if other == candidate {
+                    continue;
+                }
+                if !hardware_overlaps(&rows[candidate], &rows[other]) {
+                    continue;
+                }
+                let order =
+                    compare_versions(&rows[other].driver_version, &rows[candidate].driver_version);
+                if order == std::cmp::Ordering::Greater {
+                    let parsed = parse_version(&rows[other].driver_version);
+                    let better = best.as_ref().map(|(_, v)| parsed > *v).unwrap_or(true);
+                    if better {
+                        best = Some((other, parsed));
+                    }
+                }
+            }
+
+            if let Some((winner, _)) = best {
+                marks.push((candidate, rows[winner].normalized_folder.clone()));
+            }
+        }
+    }
+
+    let count = marks.len();
+    for (idx, folder) in marks {
+        rows[idx].superseded_by = folder;
+        rows[idx].status = "superseded".to_string();
+    }
+    count
+}
+
+/// True when two rows share at least one hardware ID.
+fn hardware_overlaps(a: &ManifestRow, b: &ManifestRow) -> bool {
+    let split = |s: &str| -> Vec<String> {
+        s.split("; ")
+            .map(|x| x.trim().to_lowercase())
+            .filter(|x| !x.is_empty())
+            .collect()
+    };
+    let (set_a, set_b) = (split(&a.hardware_ids), split(&b.hardware_ids));
+    if set_a.is_empty() || set_b.is_empty() {
+        return false;
+    }
+    set_a
+        .iter()
+        .any(|id| !id.starts_with('+') && set_b.contains(id))
+}
+
+/// Parse a dotted version string into numeric components.
+fn parse_version(v: &str) -> Vec<u64> {
+    v.split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect()
+}
+
+/// Compare two dotted version strings numerically (`31.0.101.2125` > `30.0.101.1371`).
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let (va, vb) = (parse_version(a), parse_version(b));
+    for i in 0..va.len().max(vb.len()) {
+        let x = va.get(i).copied().unwrap_or(0);
+        let y = vb.get(i).copied().unwrap_or(0);
+        match x.cmp(&y) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// Append manifest rows for installer-only categories.
@@ -423,6 +539,7 @@ fn append_installer_only_rows(
             source_folder: relative_path_str(dir),
             merged_from: String::new(),
             archive: String::new(),
+            superseded_by: String::new(),
             file_count,
             total_bytes,
             inf_hash: String::new(),
@@ -841,6 +958,82 @@ mod tests {
         assert_eq!(rows[0].hardware_id_count, 2);
         assert!(rows[0].hardware_ids.contains("DEV_8168"));
         assert!(rows[0].hardware_ids.contains("DEV_8125"));
+    }
+
+    #[test]
+    fn compare_versions_orders_numerically() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            compare_versions("31.0.101.2125", "30.0.101.1371"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("30.0.101.1371", "31.0.101.2125"),
+            Ordering::Less
+        );
+        assert_eq!(compare_versions("1.2.3", "1.2.3"), Ordering::Equal);
+        assert_eq!(compare_versions("1.10", "1.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn marks_older_version_as_superseded() {
+        let mut old = driver(
+            "MEDIA",
+            Path::new("src/a"),
+            "mshdadac.inf",
+            "MEDIA",
+            "30.0.101.1371",
+            "hA",
+        );
+        old.hardware_ids = vec!["HDAUDIO\\FUNC_01&VEN_8086&DEV_281B".to_string()];
+        let mut new = driver(
+            "MEDIA",
+            Path::new("src/b"),
+            "mshdadac.inf",
+            "MEDIA",
+            "31.0.101.2125",
+            "hB",
+        );
+        new.hardware_ids = vec!["HDAUDIO\\FUNC_01&VEN_8086&DEV_281B".to_string()];
+
+        let mut rows = plan_layout(&[old, new], &opts());
+        assert_eq!(rows.len(), 2);
+        let count = mark_superseded(&mut rows);
+        assert_eq!(count, 1);
+
+        let superseded: Vec<_> = rows.iter().filter(|r| r.status == "superseded").collect();
+        let current: Vec<_> = rows.iter().filter(|r| r.status != "superseded").collect();
+        assert_eq!(superseded.len(), 1);
+        assert_eq!(superseded[0].driver_version, "30.0.101.1371");
+        assert!(!superseded[0].superseded_by.is_empty());
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].driver_version, "31.0.101.2125");
+    }
+
+    #[test]
+    fn does_not_mark_different_hardware() {
+        let mut a = driver(
+            "MEDIA",
+            Path::new("src/a"),
+            "mshdadac.inf",
+            "MEDIA",
+            "30.0.0.1",
+            "hA",
+        );
+        a.hardware_ids = vec!["HDAUDIO\\DEV_AAAA".to_string()];
+        let mut b = driver(
+            "MEDIA",
+            Path::new("src/b"),
+            "mshdadac.inf",
+            "MEDIA",
+            "31.0.0.1",
+            "hB",
+        );
+        b.hardware_ids = vec!["HDAUDIO\\DEV_BBBB".to_string()];
+
+        let mut rows = plan_layout(&[a, b], &opts());
+        assert_eq!(mark_superseded(&mut rows), 0);
+        assert!(rows.iter().all(|r| r.status != "superseded"));
     }
 
     #[test]

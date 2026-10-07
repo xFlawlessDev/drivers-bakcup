@@ -321,10 +321,11 @@ One row per **merged** driver package.
 | `Source Folder` | Representative source path (the copied package) |
 | `Merged From` | Other source folders collapsed into this entry |
 | `Archive` | Zip file name (with `--zip`), otherwise empty |
+| `Superseded By` | Normalized folder of the newer version, when this one is outdated |
 | `File Count` / `Total Bytes` | Size of the representative package |
 | `INF SHA256` | Content hash of the representative INF |
 | `Duplicate Of` | Set when another member had identical INF content |
-| `Status` | `unique`, `merged`, `duplicate`, or `installer-only` |
+| `Status` | `unique`, `package`, `superseded`, or `installer-only` |
 
 ### `summary.csv`
 
