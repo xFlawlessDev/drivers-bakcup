@@ -364,6 +364,10 @@ fn plan_layout(drivers: &[PackDriver], opts: &PackOptions) -> Vec<ManifestRow> {
                 .provider
                 .clone()
                 .unwrap_or_else(|| "Unknown".to_string()),
+            catalog: driver
+                .catalog_file
+                .clone()
+                .unwrap_or_else(|| "None".to_string()),
             device_count: group.device_count,
             device_name_count: device_names.len(),
             device_names: format_device_names(&device_names),
@@ -409,6 +413,7 @@ fn append_installer_only_rows(
             driver_version: "None".to_string(),
             driver_date: "None".to_string(),
             provider: String::new(),
+            catalog: String::new(),
             device_count: 0,
             device_names: String::new(),
             device_name_count: 0,

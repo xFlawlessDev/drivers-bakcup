@@ -311,6 +311,7 @@ One row per **merged** driver package.
 | `Driver Version` | Version from the INF |
 | `Driver Date` | Driver date from the INF, normalized to `YYYY-MM-DD` |
 | `Provider` | Driver publisher (references resolved) |
+| `Catalog` | Catalog (`.cat`) file the INF is signed under |
 | `Device Count` | Number of device entries across merged packages |
 | `Device Name Count` | Number of unique friendly device names |
 | `Device Names` | Up to 10 unique device names, then `+N more` |

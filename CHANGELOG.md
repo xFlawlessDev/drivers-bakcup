@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.6.1 - Clearer Package Labels
+
+### Changed
+
+- A single-INF package is now named after its INF (`..._iigd_dch`) instead of its
+  catalog. Intel graphics ships `cui_dch`, `igcc_dch` and `iigd_dch` under the
+  same `igdlh.cat`; naming by catalog produced `_igdlh` and `_igdlh_2`, which was
+  misleading. Each remains its own package, matching how Windows stores them
+  separately in `DriverStore\FileRepository` (`cui_dch.inf_amd64_*`,
+  `iigd_dch.inf_amd64_*`).
+- Added a `Catalog` column to `manifest.csv` so shared catalogs are visible.
+
 ## v2.6 - Installer Bundling
 
 ### Fixed

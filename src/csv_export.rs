@@ -314,6 +314,7 @@ pub struct ManifestRow {
     pub driver_version: String,
     pub driver_date: String,
     pub provider: String,
+    pub catalog: String,
     pub device_count: usize,
     pub device_name_count: usize,
     pub device_names: String,
@@ -333,12 +334,12 @@ pub struct ManifestRow {
 /// Write the normalized driver pack manifest CSV.
 pub fn write_pack_manifest(rows: &[ManifestRow], output_path: &Path) -> Result<()> {
     let mut csv_content = String::from(
-        "Pack,ODM,Model,Revision,Category,Device Class,Driver Name,Driver Version,Driver Date,Provider,Device Count,Device Name Count,Device Names,Hardware ID Count,Hardware IDs,Normalized Folder,Source Folder,Merged From,Archive,File Count,Total Bytes,INF SHA256,Duplicate Of,Status\n",
+        "Pack,ODM,Model,Revision,Category,Device Class,Driver Name,Driver Version,Driver Date,Provider,Catalog,Device Count,Device Name Count,Device Names,Hardware ID Count,Hardware IDs,Normalized Folder,Source Folder,Merged From,Archive,File Count,Total Bytes,INF SHA256,Duplicate Of,Status\n",
     );
 
     for row in rows {
         csv_content.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             escape_csv(&row.pack),
             escape_csv(&row.odm),
             escape_csv(&row.model),
@@ -349,6 +350,7 @@ pub fn write_pack_manifest(rows: &[ManifestRow], output_path: &Path) -> Result<(
             escape_csv(&row.driver_version),
             escape_csv(&row.driver_date),
             escape_csv(&row.provider),
+            escape_csv(&row.catalog),
             row.device_count,
             row.device_name_count,
             escape_csv(&row.device_names),

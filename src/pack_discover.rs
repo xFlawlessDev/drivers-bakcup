@@ -518,13 +518,9 @@ pub fn bundle_label(driver: &PackDriver, inf_names: &[String], source_count: usi
         }
     }
 
-    // Single INF: prefer the catalog stem, then the INF stem.
-    if let Some(cat) = &driver.catalog_file {
-        let stem = file_stem(cat);
-        if !stem.is_empty() {
-            return stem;
-        }
-    }
+    // Single INF: use the INF stem. It is the most specific label and avoids
+    // collisions when several packages share one catalog (Intel graphics ships
+    // `cui_dch`, `igcc_dch` and `iigd_dch` under the same `igdlh.cat`).
     file_stem(&driver.inf_name)
 }
 
