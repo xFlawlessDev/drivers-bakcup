@@ -1,5 +1,33 @@
 # Changelog
 
+## v2.8 - Complete INF Device Coverage
+
+### Fixed
+
+A broad class of INF device entries was silently dropped, leaving packages with
+`Device Count=0` and no device names even though they declare devices. The parser
+now handles:
+
+- **Section headers with trailing comments** — `[Intel.NTamd64.10.0...17763] ; Win10 RS5`
+  was not recognized as a section, so every device under it was skipped.
+- **More hardware-ID enumerators** — `SWC\` (Software Components), `INTELAUDIO\`
+  (Intel Smart Sound), `SCSI\`, `MONITOR\`, `DISPLAY\`.
+- **Root-enumerated and vendor-defined IDs** — `*VMnetAdapter0`, `Wintun`,
+  `vmware_bridge` (previously only bus-prefixed and `VEN_`/`DEV_` IDs were kept).
+- **Bare GUID hardware IDs** — `{3EE39114-30B4-45a4-A109-19D4A40FCC22}`.
+- **Manufacturers referenced by string** — `%Name% = %Name%, NTamd64` defines the
+  section `[Wintun.NTamd64]`; string references were unresolved when the section
+  was matched. `[Strings]` is now collected in a first pass.
+- **Print-style INF lines without a hardware ID** — `desc = section, ,compat`
+  (v3 print drivers keyed by `DataFile`) now capture the device name.
+- **Quoted device descriptions** — `"Send to OneNote"` no longer keeps its quotes.
+- Trailing `;` comments on data lines are stripped (outside quotes).
+
+On the reference packs this took device-less packages from 7 to 0 (PLAX) and 4
+to 0 (a live system backup), recovering drivers such as `DAL`, `iclsClient`,
+`LMS`, `WiMan`, `cui_dch`, `igcc_dch`, `prnms006`, `netadapter` (40 devices),
+`netbridge`, `adobepdf`, and `wintun`.
+
 ## v2.7 - Aligned Backup and Pack Output
 
 ### Changed (breaking for CSV consumers)

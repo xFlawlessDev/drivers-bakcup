@@ -70,7 +70,27 @@ pub fn parse_inf_file(inf_path: &Path) -> Result<ParsedInfFile> {
     let mut manufacturers: HashMap<String, String> = HashMap::new();
     let mut device_sections: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut string_table: HashMap<String, String> = HashMap::new();
+
+    // Pass 1: collect the `[Strings]` table. Manufacturer and device sections can
+    // reference it (`%Wintun.Name%`), and `[Strings]` usually appears last.
     let mut current_section = String::new();
+    for raw in content.lines() {
+        let line = strip_trailing_comment(raw.trim());
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(section) = section_name(line) {
+            current_section = section;
+            continue;
+        }
+        if current_section == "strings" {
+            parse_strings_line(line, &mut string_table);
+        }
+    }
+
+    // Pass 2: parse version, manufacturer and device sections with the string
+    // table available for reference resolution.
+    current_section.clear();
 
     for line in content.lines() {
         let line = line.trim();
@@ -79,16 +99,21 @@ pub fn parse_inf_file(inf_path: &Path) -> Result<ParsedInfFile> {
             continue;
         }
 
-        if line.starts_with('[') && line.ends_with(']') {
-            current_section = line[1..line.len() - 1].to_lowercase();
+        // Section headers may carry a trailing comment, e.g.
+        // `[Intel.NTamd64.10.0...17763] ; Win10 RS5, 19H1`.
+        if let Some(section) = section_name(line) {
+            current_section = section;
             continue;
         }
+
+        // Strip a trailing `;` comment from data lines (but not inside quotes).
+        let line = strip_trailing_comment(line);
 
         match current_section.as_str() {
             "version" => parse_version_line(line, &mut version_info),
             "manufacturer" => parse_manufacturer_line(line, &mut manufacturers),
-            "strings" => parse_strings_line(line, &mut string_table),
-            section if is_device_section(section, &manufacturers) => {
+            "strings" => {} // already collected in pass 1
+            section if is_device_section(section, &manufacturers, &string_table) => {
                 parse_device_line(line, &current_section, &mut device_sections);
             }
             _ => {}
@@ -137,15 +162,81 @@ pub fn parse_inf_file(inf_path: &Path) -> Result<ParsedInfFile> {
     })
 }
 
-/// True when a section name belongs to one of the manufacturer-declared
-/// install sections.
-fn is_device_section(section: &str, manufacturers: &HashMap<String, String>) -> bool {
-    let sec_lower = section.to_lowercase();
-    manufacturers.values().any(|value| {
+/// Return the lowercased section name when the line is a `[Section]` header.
+///
+/// A section header may carry a trailing comment, e.g.
+/// `[Intel.NTamd64.10.0...17763] ; Win10 RS5`.
+fn section_name(line: &str) -> Option<String> {
+    if !line.starts_with('[') {
+        return None;
+    }
+    let end = line.find(']')?;
+    Some(line[1..end].trim().to_lowercase())
+}
+
+/// Remove a trailing `;` comment from an INF line, ignoring `;` inside quotes.
+fn strip_trailing_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => return line[..idx].trim_end(),
+            _ => {}
+        }
+    }
+    line
+}
+
+/// True when a section is a Models (device) section.
+///
+/// `[Manufacturer]` maps a name to a base section, e.g. `%Mfg%=Wintun, NTamd64`
+/// declares the Models sections `[Wintun]` and `[Wintun.NTamd64]`. Manufacturer
+/// entries can reference strings, so references are resolved before comparing.
+///
+/// Only the declared base (and its OS-decorated variants) is treated as a device
+/// section, so unrelated sections such as `[Wintun.Install]` are not matched.
+fn is_device_section(
+    section: &str,
+    manufacturers: &HashMap<String, String>,
+    string_table: &HashMap<String, String>,
+) -> bool {
+    let sec = section.trim().to_lowercase();
+
+    for value in manufacturers.values() {
+        // The first comma-separated field is the base section name.
         let base = value.split(',').next().unwrap_or(value);
-        let base_lower = base.to_lowercase();
-        sec_lower.starts_with(&base_lower) || base_lower.starts_with(&sec_lower)
-    })
+        let base = resolve_string(base.trim(), string_table);
+        let base = base.trim().trim_matches('"').to_lowercase();
+        if base.is_empty() {
+            continue;
+        }
+
+        // `[Base]` or `[Base.NTamd64]`, but not `[Base.Install]`.
+        if sec == base {
+            return true;
+        }
+        if let Some(suffix) = sec.strip_prefix(&format!("{}.", base)) {
+            if is_os_target(suffix) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// True for an INF target-OS decoration such as `ntamd64`, `ntx86`, `ntarm64`,
+/// `ntamd64.10.0...17763`, or a bare version like `6.0`.
+fn is_os_target(suffix: &str) -> bool {
+    let s = suffix.trim();
+    s.starts_with("nt")
+        || s.starts_with("ntamd64")
+        || s.starts_with("ntx86")
+        || s.starts_with("ntarm")
+        || s.chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
 }
 
 fn build_driver_info(
@@ -169,9 +260,13 @@ fn build_driver_info(
                 .iter()
                 .find(|(_, sec)| {
                     let base = sec.split(',').next().unwrap_or(sec);
-                    section_name
-                        .to_lowercase()
-                        .starts_with(&base.to_lowercase())
+                    let base = resolve_string(base.trim(), string_table);
+                    let base = base.trim().trim_matches('"').to_lowercase();
+                    !base.is_empty()
+                        && (section_name.to_lowercase() == base
+                            || section_name
+                                .to_lowercase()
+                                .starts_with(&format!("{}.", base)))
                 })
                 .map(|(name, _)| resolve_string(name, string_table));
 
@@ -183,7 +278,11 @@ fn build_driver_info(
                 driver_version: version_info.driver_version.clone(),
                 driver_date: version_info.driver_date.clone(),
                 driver_provider_name: resolved_provider,
-                hardware_id: Some(hardware_id.clone()),
+                hardware_id: if hardware_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(hardware_id.clone())
+                },
                 inf_name: Some(file_name.to_string()),
                 catalog_file: version_info.catalog_file.clone(),
                 manufacturer,
@@ -274,36 +373,145 @@ fn parse_device_line(
         None => return,
     };
 
-    // Format: InstallSection, HardwareID [, CompatibleID, ...]
+    // Format: InstallSection, HardwareID [, CompatibleID, ...].
+    // The description is often quoted (`"Send to OneNote" = ...`), so unquote it.
+    let device_desc = unquote_inf_value(&device_desc);
     let hw_parts: Vec<&str> = right_side.split(',').collect();
-    if hw_parts.len() >= 2 {
-        let hardware_id = hw_parts[1].trim().to_string();
-        if is_hardware_id(&hardware_id) {
+    if hw_parts.len() < 2 {
+        return;
+    }
+
+    // The hardware ID is the second field. Older v3 print INFs leave it empty and
+    // put a compatible ID / driver name in the third, e.g.
+    // `"Adobe PDF Converter" = WTPRNT.PPD, ,Adobe PDF`.
+    let hardware_id = unquote_inf_value(hw_parts[1]);
+    if is_hardware_id(&hardware_id) {
+        device_sections
+            .entry(section.to_string())
+            .or_default()
+            .push((device_desc, hardware_id));
+        return;
+    }
+
+    // Fall back to the first field that looks like a hardware ID. This also
+    // covers INFs that list only a compatible ID.
+    for part in hw_parts.iter().skip(2) {
+        let candidate = unquote_inf_value(part);
+        if is_hardware_id(&candidate) {
             device_sections
                 .entry(section.to_string())
                 .or_default()
-                .push((device_desc, hardware_id));
+                .push((device_desc, candidate));
+            return;
         }
+    }
+
+    // No hardware ID at all: still record the device with an empty ID so its
+    // name and count are captured (e.g. v3 print drivers keyed by DataFile).
+    if !device_desc.is_empty() {
+        device_sections
+            .entry(section.to_string())
+            .or_default()
+            .push((device_desc, String::new()));
     }
 }
 
+/// Device enumerator prefixes used by Windows hardware IDs.
+///
+/// `SWC\` identifies Software Components; its IDs are INF-supplied strings that
+/// the system prefixes with `SWC\` (see *INF AddComponent Directive*).
+/// `INTELAUDIO\` is the Intel Smart Sound (SST) audio bus enumerator.
+const HWID_PREFIXES: [&str; 12] = [
+    "PCI\\",
+    "USB\\",
+    "HDAUDIO\\",
+    "INTELAUDIO\\",
+    "ACPI\\",
+    "HID\\",
+    "SWD\\",
+    "ROOT\\",
+    "SWC\\",
+    "SCSI\\",
+    "MONITOR\\",
+    "DISPLAY\\",
+];
+
+/// True when a Models-section hardware-ID slot holds a real device ID.
+///
+/// INF `Models` entries have the form `desc = install-section, hwid[, compat-id...]`.
+/// The hardware ID can be:
+/// * a bus-prefixed ID (`PCI\...`, `USB\...`, `SWC\...`, `INTELAUDIO\...`);
+/// * a root-enumerated ID (`*VMnetAdapter0`, `Wintun`, `vmware_bridge`);
+/// * a bare GUID (`{3EE39114-...}`), as used by some print INFs.
+///
+/// Values that clearly are not IDs (a bare number, a bare file name, an install
+/// section name) are rejected so unrelated lines are not mistaken for devices.
 fn is_hardware_id(hardware_id: &str) -> bool {
-    if hardware_id.is_empty() {
+    let id = hardware_id.trim();
+    if id.is_empty() {
         return false;
     }
-    let upper = hardware_id.to_uppercase();
-    const PREFIXES: [&str; 7] = [
-        "PCI\\",
-        "USB\\",
-        "HDAUDIO\\",
-        "ACPI\\",
-        "HID\\",
-        "SWD\\",
-        "ROOT\\",
-    ];
-    PREFIXES.iter().any(|p| upper.starts_with(p))
-        || upper.contains("VEN_")
-        || upper.contains("DEV_")
+
+    let upper = id.to_uppercase();
+    if HWID_PREFIXES.iter().any(|p| upper.starts_with(p)) {
+        return true;
+    }
+    if upper.starts_with('*') {
+        // Root-enumerated compatible ID, e.g. `*VMnetAdapter0`.
+        return id.len() > 1;
+    }
+    if upper.contains("VEN_") || upper.contains("DEV_") {
+        return true;
+    }
+    if is_guid(id) {
+        return true;
+    }
+
+    is_vendor_defined_id(id)
+}
+
+/// Heuristic for root-enumerated, vendor-defined hardware IDs such as `Wintun`
+/// or `vmware_bridge`.
+///
+/// These contain no spaces, no path separators, and at least one letter; they are
+/// not numbers, file names, or section names.
+fn is_vendor_defined_id(id: &str) -> bool {
+    if id.len() < 3 || id.len() > 200 {
+        return false;
+    }
+    if id.contains([' ', '\\', '/', ',', '"']) {
+        return false;
+    }
+    if id.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // Reject file names and section-looking values.
+    let lower = id.to_lowercase();
+    if lower.ends_with(".inf") || lower.ends_with(".sys") || lower.ends_with(".dll") {
+        return false;
+    }
+    if lower.ends_with("install") || lower.contains("install.") {
+        return false;
+    }
+    // Must contain an ASCII letter.
+    id.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// True when the value is a single GUID, optionally brace-wrapped.
+fn is_guid(value: &str) -> bool {
+    let inner = value
+        .trim()
+        .strip_prefix('{')
+        .and_then(|v| v.strip_suffix('}'))
+        .unwrap_or(value.trim());
+
+    if inner.len() != 36 {
+        return false;
+    }
+
+    // 8-4-4-4-12 hexadecimal groups.
+    inner.split('-').map(|g| g.len()).eq([8, 4, 4, 4, 12])
+        && inner.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 fn parse_strings_line(line: &str, string_table: &mut HashMap<String, String>) {
@@ -476,5 +684,191 @@ DeviceDesc=\"Intel(R) UHD Graphics\" \"710\"
         assert_eq!(unquote_inf_value("Intel"), "Intel");
         assert_eq!(unquote_inf_value("\"Intel\""), "Intel");
         assert_eq!(unquote_inf_value("\"A\" \"B\""), "AB");
+    }
+
+    #[test]
+    fn accepts_known_hardware_id_prefixes() {
+        assert!(is_hardware_id("PCI\\VEN_8086&DEV_4680"));
+        assert!(is_hardware_id("USB\\VID_8087&PID_0025"));
+        assert!(is_hardware_id("HDAUDIO\\FUNC_01&VEN_8086"));
+        assert!(is_hardware_id("ACPI\\INTC10B0"));
+        assert!(is_hardware_id("HID\\VID_046D"));
+        assert!(is_hardware_id("SWD\\COMPUTER"));
+        assert!(is_hardware_id("ROOT\\bertreader"));
+    }
+
+    #[test]
+    fn accepts_software_component_hardware_ids() {
+        // Software Components use the `SWC\` prefix (INF AddComponent).
+        assert!(is_hardware_id("SWC\\3C4852D6-D47B-4F46-B05E-B5EDC1AA440E"));
+        assert!(is_hardware_id("SWC\\VID0001&PID0001"));
+    }
+
+    #[test]
+    fn accepts_bare_guid_hardware_ids() {
+        assert!(is_hardware_id("{3EE39114-30B4-45a4-A109-19D4A40FCC22}"));
+        assert!(is_hardware_id("3EE39114-30B4-45a4-A109-19D4A40FCC22"));
+    }
+
+    #[test]
+    fn rejects_values_that_are_not_hardware_ids() {
+        assert!(!is_hardware_id(""));
+        assert!(!is_hardware_id("2"));
+        assert!(!is_hardware_id("wintun.sys"));
+        assert!(!is_hardware_id("VMnetAdapter0.Install"));
+        assert!(!is_hardware_id("some file name"));
+    }
+
+    #[test]
+    fn accepts_root_enumerated_and_vendor_ids() {
+        // Microsoft root-enumerated compatible IDs and vendor-defined IDs.
+        assert!(is_hardware_id("*VMnetAdapter0"));
+        assert!(is_hardware_id("Wintun"));
+        assert!(is_hardware_id("vmware_bridge"));
+    }
+
+    #[test]
+    fn accepts_intel_audio_bus_hardware_ids() {
+        assert!(is_hardware_id("INTELAUDIO\\SDW_ROOT"));
+        assert!(is_hardware_id("INTELAUDIO\\FUNC_01&VEN_8086&DEV_281B"));
+    }
+
+    #[test]
+    fn strips_trailing_comments_only_outside_quotes() {
+        assert_eq!(strip_trailing_comment("A = B ; note"), "A = B");
+        assert_eq!(strip_trailing_comment("A = \"x;y\""), "A = \"x;y\"");
+        assert_eq!(strip_trailing_comment("A = B"), "A = B");
+    }
+
+    #[test]
+    fn parses_section_header_with_trailing_comment() {
+        let inf = "\
+[Version]
+Class=SoftwareComponent
+Provider=\"Intel\"
+
+[Manufacturer]
+%Mfg%=Intel, NTamd64
+
+[Intel.NTamd64.10.0...17763] ; Win10 RS5, 19H1
+%Location% = InstallSection, SWC\\PROVIDER_INTEL_COMPONENT_ICLSCLIENT
+
+[Strings]
+Mfg=\"Intel\"
+Location=\"Intel(R) iCLS Client\"
+";
+        let path = write_temp("swc_comment.inf", inf);
+        let parsed = parse_inf_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            parsed.drivers.len(),
+            1,
+            "device line after a commented header"
+        );
+        assert_eq!(
+            parsed.drivers[0].hardware_id.as_deref(),
+            Some("SWC\\PROVIDER_INTEL_COMPONENT_ICLSCLIENT")
+        );
+        assert_eq!(
+            parsed.drivers[0].device_name.as_deref(),
+            Some("Intel(R) iCLS Client")
+        );
+    }
+
+    #[test]
+    fn parses_manufacturer_referenced_by_string() {
+        // `%Company% = %Name%, NTamd64` where the section is `[Wintun.NTamd64]`.
+        let inf = "\
+[Version]
+Class=Net
+Provider=\"WireGuard LLC\"
+
+[Manufacturer]
+%Company% = %Name%, NTamd64
+
+[Wintun.NTamd64]
+%DeviceDesc% = Wintun.Install, Wintun
+
+[Strings]
+Company=\"WireGuard LLC\"
+Name=\"Wintun\"
+DeviceDesc=\"Wintun Userspace Tunnel\"
+";
+        let path = write_temp("wintun.inf", inf);
+        let parsed = parse_inf_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            parsed.drivers.len(),
+            1,
+            "device line under a referenced manufacturer"
+        );
+        assert_eq!(
+            parsed.drivers[0].device_name.as_deref(),
+            Some("Wintun Userspace Tunnel")
+        );
+        assert_eq!(parsed.drivers[0].hardware_id.as_deref(), Some("Wintun"));
+    }
+
+    #[test]
+    fn parses_printer_style_line_without_hardware_id() {
+        // v3 print INF: `desc = section, ,compat` (hardware ID slot empty).
+        let inf = "\
+[Version]
+Class=Printer
+Provider=\"Adobe\"
+
+[Manufacturer]
+%Adobe%=Adobe,NTamd64
+
+[Adobe.NTamd64]
+\"Adobe PDF Converter\" = WTPRNT.PPD, ,Adobe PDF
+
+[Strings]
+Adobe=\"Adobe\"
+";
+        let path = write_temp("adobe.inf", inf);
+        let parsed = parse_inf_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(parsed.drivers.len(), 1);
+        assert_eq!(
+            parsed.drivers[0].device_name.as_deref(),
+            Some("Adobe PDF Converter")
+        );
+        // No hardware ID, but the device is still captured.
+        assert_eq!(parsed.drivers[0].hardware_id, None);
+    }
+
+    #[test]
+    fn parses_quoted_device_description() {
+        let inf = "\
+[Version]
+Class=Printer
+Provider=\"Microsoft\"
+
+[Manufacturer]
+%Mfg%=Microsoft, NTamd64
+
+[Microsoft.NTamd64]
+\"Send to Microsoft OneNote 16 Driver\" = Install,{3EE39114-30B4-45a4-A109-19D4A40FCC22}
+
+[Strings]
+Mfg=\"Microsoft\"
+";
+        let path = write_temp("quoted_desc.inf", inf);
+        let parsed = parse_inf_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(parsed.drivers.len(), 1);
+        assert_eq!(
+            parsed.drivers[0].device_name.as_deref(),
+            Some("Send to Microsoft OneNote 16 Driver")
+        );
+        assert_eq!(
+            parsed.drivers[0].hardware_id.as_deref(),
+            Some("{3EE39114-30B4-45a4-A109-19D4A40FCC22}")
+        );
     }
 }
