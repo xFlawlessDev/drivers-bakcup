@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.7 - Aligned Backup and Pack Output
+
+### Changed (breaking for CSV consumers)
+
+- `backup`'s `all_drivers.csv` now uses the same naming and extra columns as the
+  `pack` manifest: `Driver Name` (was `INF File`), `Normalized Folder` (was
+  `Folder Name`), plus `Catalog`, `Device Name Count`, `Hardware ID Count`,
+  `INF SHA256`, and `Status`. Device names and hardware IDs are written in full.
+- `export` and `scan` CSVs were aligned to the same naming (`Driver Name`,
+  `Catalog`, and `* Count` columns).
+
+The two outputs now share 14 core columns, so either can feed the same
+driver-upload pipeline. `pack` adds pack-specific columns (`Pack`, `ODM`,
+`Model`, `Revision`, `Merged From`, `Archive`, `Superseded By`, ...).
+
 ## v2.6.3 - Complete Hardware IDs
 
 ### Changed

@@ -111,8 +111,12 @@ OEM numbers (`oemN.inf`) are reassigned between machines.
 Master CSV with one row per INF package found in the backup:
 
 ```csv
-INF File,Device Class,Provider,Driver Version,Driver Date,Device Count,Folder Name,Device Names,Hardware IDs
+Driver Name,Device Class,Driver Version,Driver Date,Provider,Catalog,Device Count,Device Name Count,Device Names,Hardware ID Count,Hardware IDs,Normalized Folder,INF SHA256,Status
 ```
+
+The columns are aligned with the `pack` manifest so either file can feed the same
+driver-upload pipeline. `Device Names` and `Hardware IDs` are written in full
+(never truncated), and `Status` is `unique` or `duplicate`.
 
 ### `device_class_legend.csv`
 

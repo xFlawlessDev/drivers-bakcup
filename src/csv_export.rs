@@ -78,7 +78,7 @@ pub fn export_wmi_drivers_csv(
     }
 
     let mut csv_content = String::from(
-        "Collection,Device Class,Provider,Driver Version,Driver Date,Device Count,Actual INFs,Device Names,Hardware IDs\n",
+        "Collection,Device Class,Provider,Driver Version,Driver Date,Device Count,Device Name Count,Device Names,Hardware ID Count,Hardware IDs,INF Names\n",
     );
 
     let mut sorted_keys: Vec<_> = grouped.keys().cloned().collect();
@@ -114,18 +114,22 @@ pub fn export_wmi_drivers_csv(
 
         let provider = first.driver_provider_name.as_deref().unwrap_or("Unknown");
         let collection_name = format!("{} {} Package", provider, version);
+        let device_names_joined = join_opt(device_names.iter().cloned().map(Some));
+        let hardware_ids_joined = join_opt(hardware_ids.iter().cloned().map(Some));
 
         csv_content.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
             escape_csv(&collection_name),
             escape_csv(first.device_class.as_deref().unwrap_or("Unknown")),
             escape_csv(provider),
             escape_csv(version),
             escape_csv(&driver_date),
             drivers_for_version.len(),
+            count_unique(&device_names_joined),
+            escape_csv(&device_names_joined),
+            count_unique(&hardware_ids_joined),
+            escape_csv(&hardware_ids_joined),
             escape_csv(&actual_infs.join("; ")),
-            escape_csv(&device_names.join("; ")),
-            escape_csv(&hardware_ids.join("; ")),
         ));
     }
 
@@ -203,14 +207,14 @@ pub fn export_inspect_csv(parsed_files: &[ParsedInfFile], output_path: &Path) ->
 /// Export `scan` results (one row per INF file) to CSV.
 pub fn export_scan_csv(parsed_files: &[ParsedInfFile], output_path: &Path) -> Result<()> {
     let mut csv_content = String::from(
-        "INF File,Device Class,Provider,Driver Version,Driver Date,Device Count,Device Names,Hardware IDs\n",
+        "Driver Name,Device Class,Provider,Driver Version,Driver Date,Catalog,Device Count,Device Name Count,Device Names,Hardware ID Count,Hardware IDs\n",
     );
     for parsed in parsed_files {
         let device_names = join_opt(parsed.drivers.iter().map(|d| d.device_name.clone()));
         let hwids = join_opt(parsed.drivers.iter().map(|d| d.hardware_id.clone()));
         csv_content.push_str(&format!(
-            "{},{},{},{},{},{},{},{}\n",
-            escape_csv(&parsed.file_name),
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            escape_csv(crate::util::strip_inf_extension(&parsed.file_name)),
             escape_csv(
                 parsed
                     .raw_version_info
@@ -233,8 +237,17 @@ pub fn export_scan_csv(parsed_files: &[ParsedInfFile], output_path: &Path) -> Re
                     .as_deref()
                     .unwrap_or("Unknown")
             ),
+            escape_csv(
+                parsed
+                    .raw_version_info
+                    .catalog_file
+                    .as_deref()
+                    .unwrap_or("None")
+            ),
             parsed.drivers.len(),
+            count_unique(&device_names),
             escape_csv(&device_names),
+            count_unique(&hwids),
             escape_csv(&hwids),
         ));
     }
@@ -245,14 +258,26 @@ pub fn export_scan_csv(parsed_files: &[ParsedInfFile], output_path: &Path) -> Re
 }
 
 /// Export the backup summary (one row per INF file, including folder path).
+///
+/// The column set mirrors the `pack` manifest closely enough to feed the same
+/// driver-upload pipeline: device/hardware ID counts, catalog, content hash, and
+/// a `Status` column. `Driver Name` and `Normalized Folder` match the pack
+/// naming, replacing the former `INF File` and `Folder Name`.
 pub fn export_backup_summary_csv(
     parsed_files: &[ParsedInfFile],
     backup_dir: &Path,
     output_path: &Path,
 ) -> Result<()> {
     let mut csv_content = String::from(
-        "INF File,Device Class,Provider,Driver Version,Driver Date,Device Count,Folder Name,Device Names,Hardware IDs\n",
+        "Driver Name,Device Class,Driver Version,Driver Date,Provider,Catalog,Device Count,Device Name Count,Device Names,Hardware ID Count,Hardware IDs,Normalized Folder,INF SHA256,Status\n",
     );
+
+    // Count rows that share an INF name + version, to mark duplicates.
+    let mut version_counts: HashMap<String, usize> = HashMap::new();
+    for parsed in parsed_files {
+        *version_counts.entry(summary_key(parsed)).or_insert(0) += 1;
+    }
+
     for parsed in parsed_files {
         let device_names = join_opt(parsed.drivers.iter().map(|d| d.device_name.clone()));
         let hwids = join_opt(parsed.drivers.iter().map(|d| d.hardware_id.clone()));
@@ -263,9 +288,14 @@ pub fn export_backup_summary_csv(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "Unknown".to_string());
 
+        let is_duplicate = version_counts
+            .get(&summary_key(parsed))
+            .map(|c| *c > 1)
+            .unwrap_or(false);
+
         csv_content.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{}\n",
-            escape_csv(&parsed.file_name),
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            escape_csv(crate::util::strip_inf_extension(&parsed.file_name)),
             escape_csv(
                 parsed
                     .raw_version_info
@@ -273,7 +303,6 @@ pub fn export_backup_summary_csv(
                     .as_deref()
                     .unwrap_or("Unknown")
             ),
-            escape_csv(resolve_provider(parsed)),
             escape_csv(
                 parsed
                     .raw_version_info
@@ -288,18 +317,66 @@ pub fn export_backup_summary_csv(
                     .as_deref()
                     .unwrap_or("Unknown")
             ),
+            escape_csv(resolve_provider(parsed)),
+            escape_csv(
+                parsed
+                    .raw_version_info
+                    .catalog_file
+                    .as_deref()
+                    .unwrap_or("None")
+            ),
             parsed.drivers.len(),
-            escape_csv(&folder_name),
+            count_unique(&device_names),
             escape_csv(&device_names),
+            count_unique(&hwids),
             escape_csv(&hwids),
+            escape_csv(&folder_name),
+            escape_csv(&file_sha256(&parsed.file_path)),
+            escape_csv(if is_duplicate { "duplicate" } else { "unique" }),
         ));
     }
 
     write_csv(output_path, &csv_content)
 }
 
+/// Grouping key for detecting duplicate INFs in a backup summary.
+fn summary_key(parsed: &ParsedInfFile) -> String {
+    format!(
+        "{}|{}",
+        parsed.file_name.to_lowercase(),
+        parsed
+            .raw_version_info
+            .driver_version
+            .as_deref()
+            .unwrap_or("Unknown")
+            .to_lowercase()
+    )
+}
+
+/// Count non-empty semicolon-separated entries.
+fn count_unique(joined: &str) -> usize {
+    joined
+        .split("; ")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+/// SHA-256 of a file, or an empty string when it cannot be read.
+fn file_sha256(path: &Path) -> String {
+    crate::util::sha256_file(path).unwrap_or_default()
+}
+
 fn join_opt(values: impl Iterator<Item = Option<String>>) -> String {
-    values.flatten().collect::<Vec<_>>().join("; ")
+    let mut items: Vec<String> = values
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    items.sort();
+    items.dedup();
+    items.join("; ")
 }
 
 /// A row of the normalized driver pack manifest.
